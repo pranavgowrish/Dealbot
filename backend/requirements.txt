@@ -1,0 +1,5 @@
+python-dotenv
+langchain-openai
+langgraph
+band-sdk[langgraph, anthropic]
+thenvoi-sdk
