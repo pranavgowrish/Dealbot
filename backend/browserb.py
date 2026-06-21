@@ -194,6 +194,54 @@ def _is_context_dir_effectively_empty(context_dir: Path) -> bool:
     return True
 
 
+# Files that are process-runtime locks/sockets, never auth state. Never copied
+# (they'd point a clone at the source browser's live process) and never deleted
+# from a target we're about to clear (a live browser may hold them).
+_PROFILE_RUNTIME_FILES = {
+    "SingletonLock",
+    "SingletonSocket",
+    "SingletonCookie",
+    "chrome.pid",
+}
+
+
+def _copy_profile_contents(source_dir: Path, target_dir: Path) -> None:
+    """Copy a Chromium user-data-dir's contents (auth, cookies, prefs) over."""
+    target_dir.mkdir(parents=True, exist_ok=True)
+    for entry in source_dir.iterdir():
+        if entry.name in _PROFILE_RUNTIME_FILES:
+            continue
+        destination = target_dir / entry.name
+        try:
+            if entry.is_dir():
+                shutil.copytree(entry, destination, dirs_exist_ok=True)
+            else:
+                shutil.copy2(entry, destination)
+        except OSError:
+            # Best-effort; continue with whatever copied successfully.
+            continue
+
+
+def _clear_profile_contents(target_dir: Path) -> None:
+    """Remove a profile dir's stale contents so it can be re-cloned fresh.
+
+    Leaves the runtime lock/socket files alone (a live browser may hold them)
+    and never deletes the dir inode itself.
+    """
+    if not target_dir.exists():
+        return
+    for entry in target_dir.iterdir():
+        if entry.name in _PROFILE_RUNTIME_FILES:
+            continue
+        try:
+            if entry.is_dir():
+                shutil.rmtree(entry, ignore_errors=True)
+            else:
+                entry.unlink(missing_ok=True)
+        except OSError:
+            continue
+
+
 def _seed_context_from_primary_profile(context_id: str) -> None:
     if not _should_seed_listing_contexts():
         return
@@ -210,32 +258,17 @@ def _seed_context_from_primary_profile(context_id: str) -> None:
     if primary_context_id == context_id:
         return
 
-    target_dir = _context_user_data_dir(context_id)
-    if not _is_context_dir_effectively_empty(target_dir):
-        return
-
     source_dir = _context_user_data_dir(primary_context_id)
     if not source_dir.exists() or _is_context_dir_effectively_empty(source_dir):
         return
 
-    skip_names = {
-        "SingletonLock",
-        "SingletonSocket",
-        "SingletonCookie",
-        "chrome.pid",
-    }
-    for entry in source_dir.iterdir():
-        if entry.name in skip_names:
-            continue
-        destination = target_dir / entry.name
-        try:
-            if entry.is_dir():
-                shutil.copytree(entry, destination, dirs_exist_ok=True)
-            else:
-                shutil.copy2(entry, destination)
-        except OSError:
-            # Best-effort profile seeding; continue with what copied successfully.
-            continue
+    # Always refresh from the (logged-in) primary profile. This previously
+    # skipped whenever the target already existed, so a listing profile created
+    # during an earlier signed-out run kept its stale cookies forever — opening
+    # logged out even after the operator authenticated the base profile.
+    target_dir = _context_user_data_dir(context_id)
+    _clear_profile_contents(target_dir)
+    _copy_profile_contents(source_dir, target_dir)
 
 
 def _clone_local_context_from_base(base_context_id: str, clone_context_id: str) -> None:
@@ -251,27 +284,13 @@ def _clone_local_context_from_base(base_context_id: str, clone_context_id: str) 
             "Log in once with STAGEHAND_CONTEXT_ID set to the base context, then retry."
         )
 
+    # Always re-clone so per-listing windows inherit the base profile's CURRENT
+    # auth state. Skipping when the clone dir already existed (from a prior run)
+    # left stale signed-out cookies in place — which is why the per-listing
+    # browsers opened logged out even though the base/search window was signed in.
     target_dir = _context_user_data_dir(resolved_clone_id)
-    if not _is_context_dir_effectively_empty(target_dir):
-        return
-
-    skip_names = {
-        "SingletonLock",
-        "SingletonSocket",
-        "SingletonCookie",
-        "chrome.pid",
-    }
-    for entry in source_dir.iterdir():
-        if entry.name in skip_names:
-            continue
-        destination = target_dir / entry.name
-        try:
-            if entry.is_dir():
-                shutil.copytree(entry, destination, dirs_exist_ok=True)
-            else:
-                shutil.copy2(entry, destination)
-        except OSError:
-            continue
+    _clear_profile_contents(target_dir)
+    _copy_profile_contents(source_dir, target_dir)
 
 
 def _env_bool(name: str, default: bool) -> bool:

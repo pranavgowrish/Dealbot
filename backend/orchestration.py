@@ -23,6 +23,7 @@ from langchain.chat_models import init_chat_model
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage
 
 from agent_events import AgentEventPublisher
+from agent_graph import CHAIN, agent_node, round_span
 from browserb import (
     close_active_listing_browser,
     close_all_active_listing_sessions,
@@ -122,6 +123,30 @@ def _emit_event(
         summary=summary,
         details=details or {},
     )
+
+
+def _ensure_user_turn(messages: list[AnyMessage]) -> list[AnyMessage]:
+    """Make a message list valid for the Anthropic API.
+
+    Two constraints, both of which surface as HTTP 400:
+      1. langchain routes SystemMessages into the separate top-level ``system``
+         parameter, so a call with only a SystemMessage (assessment / manager
+         plan) or a system prompt plus empty chat history sends an empty
+         ``messages`` array -> 'messages: at least one message is required'.
+      2. The conversation must END with a user message; some models reject a
+         trailing assistant turn -> 'This model does not support assistant
+         message prefill. The conversation must end with a user message.'
+
+    Appending a minimal user turn whenever the last non-system message is absent
+    or is an assistant (ai) message satisfies both.
+    """
+    non_system = [m for m in messages if getattr(m, "type", "") in {"human", "ai"}]
+    if not non_system or getattr(non_system[-1], "type", "") == "ai":
+        messages = [
+            *messages,
+            HumanMessage(content="Respond now, following the instructions above."),
+        ]
+    return messages
 
 
 class WorkerState(TypedDict):
@@ -358,7 +383,7 @@ Tactic selection rules:
     )
 
     try:
-        response = await model.ainvoke([prompt])
+        response = await model.ainvoke(_ensure_user_turn([prompt]))
         parsed = _extract_json_object(str(response.content))
     except Exception:
         parsed = None
@@ -476,6 +501,7 @@ def _build_fallback_manager_plan(
     }
 
 
+@agent_node("manager", name="manager_plan_round")
 async def _manager_plan_round(states: list[WorkerState]) -> dict[str, Any]:
     active_states = [
         state
@@ -538,7 +564,7 @@ Return ONLY valid JSON:
 
     parsed: dict[str, Any] | None = None
     try:
-        response = await model.ainvoke([prompt])
+        response = await model.ainvoke(_ensure_user_turn([prompt]))
         parsed = _extract_json_object(str(response.content))
     except Exception:
         parsed = None
@@ -602,6 +628,7 @@ Return ONLY valid JSON:
     }
 
 
+@agent_node("create_and_send", parent_id="evaluate_response")
 async def create_and_send(
     state: WorkerState,
     *,
@@ -697,7 +724,9 @@ Rules:
         flush=True,
     )
 
-    ai_response = await model.ainvoke([system_instruction, *existing_chat])
+    ai_response = await model.ainvoke(
+        _ensure_user_turn([system_instruction, *existing_chat])
+    )
     message_content = str(ai_response.content).strip()
     _emit_event(
         event_publisher,
@@ -767,6 +796,7 @@ Rules:
     }
 
 
+@agent_node("send_stall_message", parent_id="evaluate_response")
 async def send_stall_message(
     state: WorkerState,
     *,
@@ -791,7 +821,7 @@ Rules:
 - Hold lightly WITHOUT the cliche "let me check my schedule" / "I'll let you know" — instead show genuine continued interest (e.g. confirm the item still looks great, ask one small natural question about it, or say you're keen and finalizing a couple of details).
 - Output ONLY the message text."""
     )
-    ai_response = await model.ainvoke([prompt, *existing_chat])
+    ai_response = await model.ainvoke(_ensure_user_turn([prompt, *existing_chat]))
     message_content = str(ai_response.content).strip()
     _emit_event(
         event_publisher,
@@ -857,6 +887,7 @@ Rules:
     }
 
 
+@agent_node("pull_off", parent_id="manager")
 async def pull_off_worker(
     state: WorkerState,
     *,
@@ -904,6 +935,7 @@ async def pull_off_worker(
     }
 
 
+@agent_node("evaluate_response", parent_id="manager")
 async def evaluate_response(
     state: WorkerState,
     *,
@@ -972,7 +1004,9 @@ Based on the reply and chat context, is the seller still willing to negotiate on
 Answer ONLY "Yes" or "No"."""
     )
 
-    ai_response = await model.ainvoke([system_instruction, *existing_chat])
+    ai_response = await model.ainvoke(
+        _ensure_user_turn([system_instruction, *existing_chat])
+    )
     answer = str(ai_response.content).strip().lower()
     budged = answer.startswith("y")
     _emit_event(
@@ -996,6 +1030,7 @@ Answer ONLY "Yes" or "No"."""
     }
 
 
+@agent_node("update_memory", parent_id="evaluate_response", kind=CHAIN)
 async def update_memory(
     state: WorkerState,
     *,
@@ -1034,6 +1069,7 @@ async def update_memory(
     return {"current_min_price": new_price}
 
 
+@agent_node("wrap_up", parent_id="evaluate_response")
 async def wrap_up(
     state: WorkerState,
     *,
@@ -1398,114 +1434,119 @@ async def launch_negotiation(
                     flush=True,
                 )
 
-            manager_plan = await _manager_plan_round(states)
-            focus_worker = manager_plan.get("focus_worker")
-            manager_brief = manager_plan.get("manager_brief")
-            _emit_event(
-                event_publisher,
-                event_type="manager_thinking",
-                actor_type="manager",
-                actor_id="manager",
-                summary=f"Manager planned round focus on {focus_worker}",
-                details={
-                    "focus_worker": focus_worker,
-                    "manager_brief": manager_brief,
-                    "review_workers": review_workers,
-                    "directives": manager_plan.get("directives"),
-                },
-            )
-            print(
-                f"[manager] focus={focus_worker} | {manager_brief}",
-                flush=True,
-            )
-            for worker_id, directive in (manager_plan.get("directives") or {}).items():
-                if not isinstance(directive, dict):
-                    continue
+            # One root span per round so the manager node and every worker node
+            # land in the SAME trace -> Arize's per-trace Agent Graph can draw
+            # the connected manager -> worker -> action graph. The gathered
+            # worker tasks inherit this span's context at creation time.
+            with round_span("negotiation_round"):
+                manager_plan = await _manager_plan_round(states)
+                focus_worker = manager_plan.get("focus_worker")
+                manager_brief = manager_plan.get("manager_brief")
                 _emit_event(
                     event_publisher,
-                    event_type="manager_directive",
+                    event_type="manager_thinking",
                     actor_type="manager",
                     actor_id="manager",
-                    summary=f"Manager directed {worker_id} ({directive.get('mode')})",
+                    summary=f"Manager planned round focus on {focus_worker}",
                     details={
-                        "worker_id": worker_id,
-                        "role": directive.get("role"),
-                        "mode": directive.get("mode"),
-                        "instruction": directive.get("instruction"),
                         "focus_worker": focus_worker,
+                        "manager_brief": manager_brief,
+                        "review_workers": review_workers,
+                        "directives": manager_plan.get("directives"),
                     },
                 )
                 print(
-                    f"[manager] {worker_id}: role={directive.get('role')} "
-                    f"mode={directive.get('mode')} | {directive.get('instruction')}",
+                    f"[manager] focus={focus_worker} | {manager_brief}",
                     flush=True,
                 )
-            await _apply_manager_plan_to_states(states, manager_plan)
-
-            async def _run_worker_round(state: WorkerState) -> None:
-                if state.get("manager_mode") == "pull_off":
-                    pull_result = await pull_off_worker(
-                        state,
-                        event_publisher=event_publisher,
+                for worker_id, directive in (manager_plan.get("directives") or {}).items():
+                    if not isinstance(directive, dict):
+                        continue
+                    _emit_event(
+                        event_publisher,
+                        event_type="manager_directive",
+                        actor_type="manager",
+                        actor_id="manager",
+                        summary=f"Manager directed {worker_id} ({directive.get('mode')})",
+                        details={
+                            "worker_id": worker_id,
+                            "role": directive.get("role"),
+                            "mode": directive.get("mode"),
+                            "instruction": directive.get("instruction"),
+                            "focus_worker": focus_worker,
+                        },
                     )
-                    state.update(pull_result)
-                    return
-
-                evaluation = await evaluate_response(
-                    state,
-                    event_publisher=event_publisher,
-                )
-                state.update(evaluation)
-
-                if state.get("success"):
-                    return
-
-                if state.get("awaiting_reply") and not (state.get("last_reply") or "").strip():
                     print(
-                        f"[{state['worker_id']}] awaiting seller reply; "
-                        "no new directive action this tick.",
+                        f"[manager] {worker_id}: role={directive.get('role')} "
+                        f"mode={directive.get('mode')} | {directive.get('instruction')}",
                         flush=True,
                     )
-                    return
+                await _apply_manager_plan_to_states(states, manager_plan)
 
-                if state.get("seller_budged"):
-                    price_update = await update_memory(
+                async def _run_worker_round(state: WorkerState) -> None:
+                    if state.get("manager_mode") == "pull_off":
+                        pull_result = await pull_off_worker(
+                            state,
+                            event_publisher=event_publisher,
+                        )
+                        state.update(pull_result)
+                        return
+
+                    evaluation = await evaluate_response(
                         state,
                         event_publisher=event_publisher,
                     )
-                    state.update(price_update)
+                    state.update(evaluation)
 
-                if state["negotiation_round"] >= state["max_rounds"]:
-                    wrap_result = await wrap_up(
-                        state,
-                        event_publisher=event_publisher,
-                    )
-                    state.update(wrap_result)
-                    return
+                    if state.get("success"):
+                        return
 
-                if state.get("manager_mode") == "stall":
-                    turn_result = await send_stall_message(
-                        state,
-                        event_publisher=event_publisher,
-                    )
-                else:
-                    turn_result = await create_and_send(
-                        state,
-                        event_publisher=event_publisher,
-                    )
-                state.update(turn_result)
+                    if state.get("awaiting_reply") and not (state.get("last_reply") or "").strip():
+                        print(
+                            f"[{state['worker_id']}] awaiting seller reply; "
+                            "no new directive action this tick.",
+                            flush=True,
+                        )
+                        return
 
-                if (
-                    not state.get("success")
-                    and state["negotiation_round"] >= state["max_rounds"]
-                ):
-                    wrap_result = await wrap_up(
-                        state,
-                        event_publisher=event_publisher,
-                    )
-                    state.update(wrap_result)
+                    if state.get("seller_budged"):
+                        price_update = await update_memory(
+                            state,
+                            event_publisher=event_publisher,
+                        )
+                        state.update(price_update)
 
-            await asyncio.gather(*(_run_worker_round(state) for state in active_states))
+                    if state["negotiation_round"] >= state["max_rounds"]:
+                        wrap_result = await wrap_up(
+                            state,
+                            event_publisher=event_publisher,
+                        )
+                        state.update(wrap_result)
+                        return
+
+                    if state.get("manager_mode") == "stall":
+                        turn_result = await send_stall_message(
+                            state,
+                            event_publisher=event_publisher,
+                        )
+                    else:
+                        turn_result = await create_and_send(
+                            state,
+                            event_publisher=event_publisher,
+                        )
+                    state.update(turn_result)
+
+                    if (
+                        not state.get("success")
+                        and state["negotiation_round"] >= state["max_rounds"]
+                    ):
+                        wrap_result = await wrap_up(
+                            state,
+                            event_publisher=event_publisher,
+                        )
+                        state.update(wrap_result)
+
+                await asyncio.gather(*(_run_worker_round(state) for state in active_states))
     finally:
         stop_live_listener.set()
         stop_reply_poller.set()

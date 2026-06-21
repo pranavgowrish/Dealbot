@@ -12,7 +12,7 @@ from typing import Any
 import redis
 from dotenv import load_dotenv
 from langchain.chat_models import init_chat_model
-from langchain_core.messages import SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 
 from agent_events import AgentEventPublisher
 from browserb import initialize_browsers, send_listing_message
@@ -178,7 +178,11 @@ Rules:
     )
 
     try:
-        response = await model.ainvoke([prompt])
+        # Anthropic requires >=1 non-system message; a lone SystemMessage sends
+        # an empty `messages` array -> HTTP 400. Pair it with a user turn.
+        response = await model.ainvoke(
+            [prompt, HumanMessage(content="Write the opener message now.")]
+        )
         message = str(response.content).strip().strip('"').strip("'")
         return message or _build_first_message_fallback(product, product_name=product_name)
     except Exception:
