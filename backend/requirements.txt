@@ -2,6 +2,7 @@ browserbase
 stagehand
 dotenv
 python-dotenv
+redis
 langchain-openai
 langgraph
 band-sdk[langgraph, anthropic]

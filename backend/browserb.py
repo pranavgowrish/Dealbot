@@ -160,6 +160,15 @@ LISTING_SCHEMA: dict[str, Any] = {
     "required": ["title", "price", "description", "seller_name", "location"],
 }
 
+REPLY_CHECK_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "seller_replied": {"type": "boolean"},
+        "reply_message": {"type": ["string", "null"]},
+    },
+    "required": ["seller_replied", "reply_message"],
+}
+
 
 def _to_dict(value: Any) -> dict[str, Any] | None:
     if value is None:
@@ -180,6 +189,30 @@ def _listing_id(link: str) -> str:
 
 def _debug_print(label: str, message: str) -> None:
     print(f"[{label}] {message}")
+
+
+def _build_send_message_instruction(message: str) -> str:
+    quoted = json.dumps(message)
+    return f"""You are on a Facebook Marketplace listing page.
+
+1. Click the "Message" or "Message seller" button to open the chat/message box.
+2. If the chat is already open, focus the message input at the bottom.
+3. Type this message EXACTLY: {quoted}
+4. Send it by pressing Enter or clicking Send.
+5. Do NOT scroll through or read old chat history.
+
+Stop as soon as the message is sent."""
+
+
+def _build_reply_check_instruction(message: str) -> str:
+    quoted = json.dumps(message)
+    return f"""In the open Marketplace chat, look only at messages that appeared AFTER the buyer sent this exact message: {quoted}
+
+Ignore all earlier chat history.
+
+Return:
+- seller_replied: true only if the seller sent a new message after that buyer message
+- reply_message: the seller's newest message text after that buyer message, or null if none"""
 
 
 # ---------------------------------------------------------------------------
@@ -209,7 +242,10 @@ async def search_marketplace(
     resolved_context_id = context_id or os.environ.get("BROWSERBASE_CONTEXT_ID")
 
     bb = Browserbase(api_key=os.environ["BROWSERBASE_API_KEY"])
-    session_opts: dict[str, Any] = {"project_id": os.environ["BROWSERBASE_PROJECT_ID"]}
+    session_opts: dict[str, Any] = {
+        "project_id": os.environ["BROWSERBASE_PROJECT_ID"],
+        "keep_alive": True,
+    }
     if resolved_context_id:
         session_opts["browser_settings"] = {
             "context": {"id": resolved_context_id, "persist": True}
@@ -284,10 +320,15 @@ async def _scrape_listing(
     Creates one Browserbase session, opens the page,
     extracts listing details, and returns the result.
     """
+    load_dotenv()
+
     resolved_context_id = os.environ.get("BROWSERBASE_CONTEXT_ID")
 
     bb = Browserbase(api_key=os.environ["BROWSERBASE_API_KEY"])
-    session_opts: dict[str, Any] = {"project_id": os.environ["BROWSERBASE_PROJECT_ID"]}
+    session_opts: dict[str, Any] = {
+        "project_id": os.environ["BROWSERBASE_PROJECT_ID"],
+        "keep_alive": True,
+    }
     if resolved_context_id:
         session_opts["browser_settings"] = {
             "context": {"id": resolved_context_id, "persist": True}
@@ -301,7 +342,6 @@ async def _scrape_listing(
         model_api_key=os.environ["MODEL_API_KEY"],
         _strict_response_validation=True,
     ) as client:
-
         try:
             session = await client.sessions.start(
                 model_name=model_name,
@@ -312,75 +352,156 @@ async def _scrape_listing(
             print(e.response.text)
             raise
 
-        try:
-            await session.navigate(
-                url=link,
-                options={"wait_until": "domcontentloaded"},
+        if not session.id:
+            raise RuntimeError(f"Expected session ID, got {session!r}")
+
+        await session.navigate(
+            url=link,
+            options={"wait_until": "domcontentloaded"},
+        )
+
+        label = _listing_id(link)
+        _debug_print(label, "navigated, extracting listing data…")
+
+        response = await session.extract(
+            instruction=(
+                "Extract the Facebook Marketplace listing details "
+                "visible on this page."
+            ),
+            schema=LISTING_SCHEMA,
+            options={"model": model_name},
+        )
+
+        data = _to_dict(response.data.result if response.data else None)
+        if data:
+            _debug_print(
+                label,
+                f"{data.get('title', '?')} — {data.get('price', '?')} "
+                f"({data.get('location', '?')})",
+            )
+        else:
+            _debug_print(
+                label,
+                f"extract returned no data (success={response.success})",
             )
 
-            label = _listing_id(link)
-            _debug_print(label, "navigated, extracting listing data…")
-
-            response = await session.extract(
-                instruction=(
-                    "Extract the Facebook Marketplace listing details "
-                    "visible on this page."
-                ),
-                schema=LISTING_SCHEMA,
-                options={"model": model_name},
-            )
-
-            data = _to_dict(response.data.result if response.data else None)
-            if data:
-                _debug_print(
-                    label,
-                    f"{data.get('title', '?')} — {data.get('price', '?')} "
-                    f"({data.get('location', '?')})",
-                )
-            else:
-                _debug_print(
-                    label,
-                    f"extract returned no data (success={response.success})",
-                )
-
-            return {
-                "browserbase_session_id": bb_session.id,
-                "listing_url": link,
-                "data": data,
-            }
-
-        finally:
-            try:
-                await session.end()
-            except Exception:
-                pass
+        return {
+            "browserbase_session_id": bb_session.id,
+            "listing_url": link,
+            "data": data,
+        }
 
 
 async def initialize_browsers(
     links: list[str],
     *,
     model_name: str = "anthropic/claude-sonnet-4-6",
+    max_concurrency: int = 2,
+    scrape_timeout_s: float = 120,
 ) -> list[dict[str, Any]]:
     """
     Launches one Browserbase + Stagehand session per URL
     and scrapes all pages concurrently.
     """
-
     load_dotenv()
 
-    print(f"Scraping {len(links)} listing(s)…")
+    print(f"Scraping {len(links)} listing(s)…", flush=True)
 
-    tasks = [
-        _scrape_listing(link=link, model_name=model_name)
-        for link in links
-    ]
+    semaphore = asyncio.Semaphore(max(1, max_concurrency))
 
+    async def _run(link: str, index: int) -> dict[str, Any]:
+        label = _listing_id(link)
+        async with semaphore:
+            print(f"[{index}/{len(links)}] starting {label}…", flush=True)
+            try:
+                return await asyncio.wait_for(
+                    _scrape_listing(link=link, model_name=model_name),
+                    timeout=scrape_timeout_s,
+                )
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError(
+                    f"Scrape timed out after {scrape_timeout_s:.0f}s for {link}"
+                ) from exc
+
+    tasks = [_run(link, i) for i, link in enumerate(links, start=1)]
     results = await asyncio.gather(*tasks)
 
     print("\nFinal JSON:")
     print(json.dumps(results, indent=2))
 
     return results
+
+
+async def send_listing_message(
+    browserbase_session_id: str,
+    message: str,
+    *,
+    model_name: str = "anthropic/claude-sonnet-4-6",
+    reply_wait_ms: int = 2500,
+) -> dict[str, str | None]:
+    """
+    Resume a Browserbase session, open the listing message box, send a message,
+    wait for a reply, and return only the sent message and any seller reply.
+    """
+    load_dotenv()
+
+    async with AsyncStagehand(
+        browserbase_api_key=os.environ["BROWSERBASE_API_KEY"],
+        browserbase_project_id=os.environ["BROWSERBASE_PROJECT_ID"],
+        model_api_key=os.environ["MODEL_API_KEY"],
+        _strict_response_validation=True,
+    ) as client:
+        try:
+            session = await client.sessions.start(
+                model_name=model_name,
+                browserbase_session_id=browserbase_session_id,
+            )
+        except APIResponseValidationError as e:
+            print(f"Session schema error — HTTP {e.response.status_code}")
+            print(e.response.text)
+            raise
+
+        if not session.id:
+            raise RuntimeError(f"Expected session ID, got {session!r}")
+
+        _debug_print(browserbase_session_id[:8], "resumed session, opening chat…")
+
+        await session.execute(
+            agent_config={"model": model_name},
+            execute_options={
+                "instruction": _build_send_message_instruction(message),
+                "max_steps": 8,
+            },
+        )
+
+        _debug_print(
+            browserbase_session_id[:8],
+            f"sent message, waiting {reply_wait_ms}ms…",
+        )
+        await asyncio.sleep(reply_wait_ms / 1000)
+
+        response = await session.extract(
+            instruction=_build_reply_check_instruction(message),
+            schema=REPLY_CHECK_SCHEMA,
+            options={"model": model_name},
+        )
+
+        reply_data = _to_dict(response.data.result if response.data else None) or {}
+        reply: str | None = None
+        if reply_data.get("seller_replied"):
+            raw_reply = reply_data.get("reply_message")
+            if isinstance(raw_reply, str):
+                reply = raw_reply.strip() or None
+
+        result = {
+            "sent_message": message,
+            "reply_message": reply,
+        }
+        _debug_print(
+            browserbase_session_id[:8],
+            f"reply={'yes' if reply else 'no'}",
+        )
+        return result
 
 
 

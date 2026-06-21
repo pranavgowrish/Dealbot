@@ -4,3 +4,5 @@
 .venv
 agent_config.yaml
 .env
+.vendor
+__pycache__
