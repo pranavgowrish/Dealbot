@@ -11,31 +11,13 @@ import { LoadingProgress } from './components/LoadingProgress';
 import { useAgentStream } from './hooks/useAgentStream';
 
 const LOGO_SRC = '/LOGO_SRC.png';
-/** UI timing only — swap to real API await when wiring backend response. */
-const FASTAPI_LOADING_MS = 10_000;
+const API_BASE = 'http://localhost:8000';
 /** Business rule — max picks before confirm. Change if product allows more/fewer. */
 const MAX_LISTING_SELECTIONS = 5;
-/** Must match backend listing count (currently 10 in main.py). */
-const MOCK_LISTING_COUNT = 10;
 
-/** HARDCODED UI — replace with dynamic suggestions from search history or API. */
+/** UI-only — quick-fill chips for the search form. */
 const PRODUCT_CHIPS = ['Couch', 'iPhone 14 Pro', 'Electric guitar', 'Office chair'];
-/** HARDCODED UI — replace with slider or parsed max budget from user profile. */
 const BUDGET_CHIPS = ['$300', '$600', '$1000', '$2000'];
-
-/** HARDCODED UI — delete when listings come from POST /api/v1/orchestrate response. */
-const MOCK_TITLES = [
-  'Vintage leather sectional — great condition',
-  'iPhone 14 Pro 256GB — unlocked',
-  'Mid-century modern desk chair',
-  'Like-new road bike — barely used',
-  'Sony WH-1000XM5 headphones',
-  'Standing desk with drawer',
-  'Nintendo Switch OLED bundle',
-  'West Elm dining table',
-  'MacBook Air M2 — 16GB RAM',
-  'Patagonia down jacket — size M',
-];
 
 type LoadingState =
   | 'idle'
@@ -43,14 +25,20 @@ type LoadingState =
   | 'show_listings'
   | 'success_confirmed';
 
-/** HARDCODED UI — replace with `listings` state populated from fetch response in handleSubmit. */
-const MOCK_LISTINGS = Array.from({ length: MOCK_LISTING_COUNT }, (_, i) => ({
-  id: i + 1,
-  title: MOCK_TITLES[i] ?? `Listing ${i + 1}`,
-  price: `$${(380 + i * 47).toLocaleString()}`, // TODO: use listing.price from API
-  area: ['LA', 'Pasadena', 'Glendale', 'Burbank', 'Santa Monica'][i % 5], // TODO: use listing.location from API
-  source: ['Facebook', 'Craigslist', 'OfferUp', 'Mercari', 'Nextdoor'][i % 5], // TODO: use listing.source from API
-}));
+type Listing = {
+  id: number;
+  title: string;
+  price: string;
+  image_url?: string | null;
+  listing_url: string;
+  area: string;
+  source: string;
+};
+
+function parsePrice(value: string): number {
+  const parsed = parseFloat(value.replace(/[$,]/g, '').trim());
+  return Number.isFinite(parsed) ? parsed : 0;
+}
 
 function journeyIndex(state: LoadingState): number {
   switch (state) {
@@ -75,16 +63,19 @@ export default function App() {
   const [color, setColor] = useState('');
 
   const [loadingState, setLoadingState] = useState<LoadingState>('idle');
+  const [listings, setListings] = useState<Listing[]>([]);
   const [selectedListings, setSelectedListings] = useState<number[]>([]);
+  const [searchError, setSearchError] = useState<string | null>(null);
+  const [orchestrateError, setOrchestrateError] = useState<string | null>(null);
+  const [isConfirming, setIsConfirming] = useState(false);
   /** UI-only — controls optional filters accordion; not sent anywhere special. */
   const [showOptionalFilters, setShowOptionalFilters] = useState(false);
-  /** UI-only — fake loader animation; does not control screen transitions. */
+  /** UI-only — loader animation driven by elapsed time during search. */
   const [loaderProgress, setLoaderProgress] = useState(0);
   const [loaderStep, setLoaderStep] = useState(0);
-  /** UI-only — fake candidate count for loader copy; replace with real scan progress from API/SSE. */
   const [loaderListingCount, setLoaderListingCount] = useState(0);
 
-  const fastapiTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const loaderIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const { reset } = useAgentStream({ simulate: true });
 
@@ -96,60 +87,92 @@ export default function App() {
 
   useEffect(() => {
     return () => {
-      if (fastapiTimeoutRef.current) clearTimeout(fastapiTimeoutRef.current);
+      if (loaderIntervalRef.current) clearInterval(loaderIntervalRef.current);
     };
   }, []);
 
-  /** UI-only — animates loader panel; screen still advances via fastapiTimeoutRef below. */
   useEffect(() => {
     if (loadingState !== 'fastapi_loading') {
       setLoaderProgress(0);
       setLoaderStep(0);
       setLoaderListingCount(0);
+      if (loaderIntervalRef.current) {
+        clearInterval(loaderIntervalRef.current);
+        loaderIntervalRef.current = null;
+      }
       return;
     }
 
     const start = Date.now();
-    const interval = setInterval(() => {
+    loaderIntervalRef.current = setInterval(() => {
       const elapsed = Date.now() - start;
-      const ratio = Math.min(1, elapsed / FASTAPI_LOADING_MS);
-      setLoaderProgress(ratio * 100);
+      const ratio = Math.min(1, elapsed / 120_000);
+      setLoaderProgress(ratio * 95);
       setLoaderStep(Math.min(5, Math.floor(ratio * 6)));
       setLoaderListingCount(Math.min(10, Math.floor(ratio * 12)));
     }, 120);
 
-    return () => clearInterval(interval);
+    return () => {
+      if (loaderIntervalRef.current) {
+        clearInterval(loaderIntervalRef.current);
+        loaderIntervalRef.current = null;
+      }
+    };
   }, [loadingState]);
 
-  const handleSubmit = (e: FormEvent) => {
+  const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
-    if (!product.trim() || !price.trim() || !location.trim()) return;
+    const parsedPrice = parsePrice(price);
+    if (!product.trim() || !location.trim() || parsedPrice <= 0) return;
 
-    if (fastapiTimeoutRef.current) clearTimeout(fastapiTimeoutRef.current);
-
+    setSearchError(null);
+    setOrchestrateError(null);
     setSelectedListings([]);
+    setListings([]);
     setLoadingState('fastapi_loading');
 
-    fastapiTimeoutRef.current = setTimeout(() => {
-      setLoadingState('show_listings');
-      fastapiTimeoutRef.current = null;
-    }, FASTAPI_LOADING_MS);
+    try {
+      const response = await fetch(`${API_BASE}/api/v1/search`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          product: product.trim(),
+          price: parsedPrice,
+          location: location.trim(),
+          dateListed: dateListed.trim() || undefined,
+          condition: condition.trim() || undefined,
+          color: color.trim() || undefined,
+        }),
+      });
 
-    // TODO: await response, store in listings state, then setLoadingState('show_listings')
-    void fetch('http://localhost:8000/api/v1/orchestrate', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        product,
-        price: parseFloat(price),
-        location,
-        dateListed,
-        condition,
-        color,
-      }),
-    }).catch((error) => {
-      console.error('Failed hitting api.dealbot.ai/v1/orchestrate', error);
-    });
+      if (!response.ok) {
+        const body = await response.json().catch(() => null);
+        const detail =
+          body && typeof body.detail === 'string'
+            ? body.detail
+            : `Search failed (${response.status})`;
+        throw new Error(detail);
+      }
+
+      const data = (await response.json()) as { listings: Listing[] };
+      setLoaderProgress(100);
+      setLoaderListingCount(data.listings.length);
+      setListings(data.listings);
+
+      if (data.listings.length === 0) {
+        setSearchError('No listings matched your search. Try adjusting your budget or filters.');
+        setLoadingState('idle');
+        return;
+      }
+
+      setLoadingState('show_listings');
+    } catch (error) {
+      console.error('Marketplace search failed', error);
+      setSearchError(
+        error instanceof Error ? error.message : 'Failed to search marketplaces.',
+      );
+      setLoadingState('idle');
+    }
   };
 
   const toggleListingSelection = (listingId: number) => {
@@ -162,19 +185,61 @@ export default function App() {
     });
   };
 
-  const handleConfirmListings = () => {
-    if (selectedListings.length === 0) return;
-    setLoadingState('success_confirmed');
+  const handleConfirmListings = async () => {
+    if (selectedListings.length === 0 || isConfirming) return;
+
+    const parsedPrice = parsePrice(price);
+    const selectedUrls = selectedListings
+      .map((id) => listings.find((listing) => listing.id === id)?.listing_url)
+      .filter((url): url is string => Boolean(url));
+
+    if (selectedUrls.length === 0) return;
+
+    setIsConfirming(true);
+    setOrchestrateError(null);
+
+    try {
+      const response = await fetch(`${API_BASE}/api/v1/orchestrate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          product: product.trim(),
+          budget: parsedPrice,
+          max_price: parsedPrice,
+          listing_urls: selectedUrls,
+        }),
+      });
+
+      if (!response.ok) {
+        const body = await response.json().catch(() => null);
+        const detail =
+          body && typeof body.detail === 'string'
+            ? body.detail
+            : `Orchestration failed (${response.status})`;
+        throw new Error(detail);
+      }
+
+      setLoadingState('success_confirmed');
+    } catch (error) {
+      console.error('Orchestration failed', error);
+      setOrchestrateError(
+        error instanceof Error
+          ? error.message
+          : 'Failed to start agent orchestration.',
+      );
+    } finally {
+      setIsConfirming(false);
+    }
   };
 
   const handleReset = () => {
-    if (fastapiTimeoutRef.current) {
-      clearTimeout(fastapiTimeoutRef.current);
-      fastapiTimeoutRef.current = null;
-    }
     reset();
     setLoadingState('idle');
+    setListings([]);
     setSelectedListings([]);
+    setSearchError(null);
+    setOrchestrateError(null);
+    setIsConfirming(false);
     setProduct('');
     setPrice('');
     setLocation('');
@@ -279,6 +344,12 @@ export default function App() {
                     Fill in what you&apos;re after and we&apos;ll handle the rest.
                   </p>
                 </div>
+
+                {searchError && (
+                  <p className="form-panel-sub" role="alert">
+                    {searchError}
+                  </p>
+                )}
 
                 <div className="bento-form">
                   <div className="bento-panel-product">
@@ -482,7 +553,7 @@ export default function App() {
               </header>
 
               <div className="listings-bento">
-                {MOCK_LISTINGS.map((listing) => {
+                {listings.map((listing) => {
                   const isSelected = selectedListings.includes(listing.id);
                   const isMaxReached =
                     selectedListings.length >= MAX_LISTING_SELECTIONS;
@@ -495,14 +566,22 @@ export default function App() {
                       className={`listing-tile ${isSelected ? 'listing-tile--active' : ''} ${isDisabled ? 'listing-tile--disabled' : ''}`}
                     >
                       <div className="listing-image-wrap">
-                        <div
-                          className="listing-image-placeholder"
-                          aria-hidden
-                        >
-                          <span className="listing-image-icon" aria-hidden>
-                            📦
-                          </span>
-                        </div>
+                        {listing.image_url ? (
+                          <img
+                            src={listing.image_url}
+                            alt=""
+                            className="listing-image-placeholder"
+                          />
+                        ) : (
+                          <div
+                            className="listing-image-placeholder"
+                            aria-hidden
+                          >
+                            <span className="listing-image-icon" aria-hidden>
+                              📦
+                            </span>
+                          </div>
+                        )}
                         <div className="listing-meta-pills">
                           <span className="listing-meta-pill">{listing.source}</span>
                         </div>
@@ -542,16 +621,24 @@ export default function App() {
                   {selectedListings.length} of {MAX_LISTING_SELECTIONS} selected
                 </p>
 
+                {orchestrateError && (
+                  <p className="listing-selection-count" role="alert">
+                    {orchestrateError}
+                  </p>
+                )}
+
                 <div className="listings-actions">
                   <button
                     type="button"
                     onClick={handleConfirmListings}
-                    disabled={selectedListings.length === 0}
+                    disabled={selectedListings.length === 0 || isConfirming}
                     className="btn-confirm-listings listings-actions-primary"
                   >
-                    {selectedListings.length === 0
-                      ? 'Select listings to continue'
-                      : `Confirm ${selectedListings.length} listing${selectedListings.length > 1 ? 's' : ''} →`}
+                    {isConfirming
+                      ? 'Starting agents…'
+                      : selectedListings.length === 0
+                        ? 'Select listings to continue'
+                        : `Confirm ${selectedListings.length} listing${selectedListings.length > 1 ? 's' : ''} →`}
                   </button>
                 </div>
               </div>
@@ -595,7 +682,6 @@ export default function App() {
                 </div>
 
                 <ol className="success-timeline">
-                  {/* HARDCODED UI — drive from real hunt status / webhook updates when available. */}
                   <li className="success-timeline-item success-timeline-item--complete">
                     <span className="success-timeline-dot" aria-hidden />
                     Listings approved
@@ -615,11 +701,12 @@ export default function App() {
                 </ol>
 
                 <div className="success-agents-row">
-                  {/* HARDCODED UI — replace with live agent heartbeat from backend. */}
-                  {Array.from({ length: 5 }, (_, i) => (
+                  {Array.from({ length: selectedListings.length }, (_, i) => (
                     <span key={i} className="success-agent-dot" aria-hidden />
                   ))}
-                  <span className="success-agents-label">5 agents active</span>
+                  <span className="success-agents-label">
+                    {selectedListings.length} agent{selectedListings.length > 1 ? 's' : ''} active
+                  </span>
                 </div>
 
                 <button type="button" onClick={handleReset} className="btn-reset">

@@ -8,6 +8,7 @@ langgraph
 langchain-anthropic
 
 browserbase
+playwright
 stagehand
 dotenv
 python-dotenv

@@ -1,126 +1,50 @@
 """
-Assign worker/manager agents to Marketplace listings, persist memory in Redis,
-scrape listing data via browserb, and draft opening seller messages.
-
-Local Redis (Docker):
-  docker compose up -d redis
-
-Optional .env override:
-  REDIS_URL=redis://localhost:6379/0
+Assign worker agents to Marketplace listings, persist memory in Redis,
+scrape listing data, send opening seller messages, then run negotiation loops.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 from typing import Any
 
 import redis
 from dotenv import load_dotenv
+from langchain.chat_models import init_chat_model
+from langchain_core.messages import SystemMessage
 
 from browserb import initialize_browsers, send_listing_message
+from memory import AgentMemoryStore, parse_price
 
+model = init_chat_model("claude-sonnet-4-6", temperature=0.4)
 
-# ---------------------------------------------------------------------------
-# Job configuration
-# ---------------------------------------------------------------------------
-
-PRODUCT_NAME = "Gray Couch"
-TARGET_BUDGET = 40
-MAX_PRICE = 50
-
-LISTING_URLS = [
-    "https://www.facebook.com/marketplace/item/954225447099368/?ref=search&referral_code=null&referral_story_type=post&tracking=browse_serp%3Ae9ebf225-f0d9-414c-b089-9d392df74096",
-    "https://www.facebook.com/marketplace/item/1346267354014284/?ref=search&referral_code=null&referral_story_type=post&tracking=browse_serp%3Ae9ebf225-f0d9-414c-b089-9d392df74096",
-    "https://www.facebook.com/marketplace/item/954225447099368/?ref=search&referral_code=null&referral_story_type=post&tracking=browse_serp%3Ae9ebf225-f0d9-414c-b089-9d392df74096",
+DEFAULT_PRODUCT_NAME = "Gray Couch"
+DEFAULT_TARGET_BUDGET = 40
+DEFAULT_MAX_PRICE = 50
+DEFAULT_LISTING_URLS = [
+    "https://www.facebook.com/marketplace/item/985732227779817/",
     "https://www.facebook.com/marketplace/item/1346267354014284/?ref=search&referral_code=null&referral_story_type=post&tracking=browse_serp%3Ae9ebf225-f0d9-414c-b089-9d392df74096",
     "https://www.facebook.com/marketplace/item/954225447099368/?ref=search&referral_code=null&referral_story_type=post&tracking=browse_serp%3Ae9ebf225-f0d9-414c-b089-9d392df74096",
 ]
-
-WORKER_NAMES = ["worker1", "worker2", "worker3", "worker4", "worker5"]
-MANAGER_AGENT_ID = "manager"
-
-# Populated during initialize_agents()
-WORKER_AGENT_IDS: dict[str, str] = {name: name for name in WORKER_NAMES}
-WORKER_SESSION_IDS: dict[str, str] = {}
-
-
-# ---------------------------------------------------------------------------
-# Redis (local Docker by default)
-# ---------------------------------------------------------------------------
-
-DEFAULT_REDIS_URL = "redis://localhost:6379/0"
-
-
-def _redis_client() -> redis.Redis:
-    url = os.environ.get("REDIS_URL", DEFAULT_REDIS_URL).strip() or DEFAULT_REDIS_URL
-    return redis.Redis.from_url(
-        url,
-        decode_responses=True,
-        socket_connect_timeout=5,
-        socket_timeout=5,
-    )
 
 
 def _log(message: str) -> None:
     print(message, flush=True)
 
 
-class AgentMemoryStore:
-    """Short- and long-term memory stored in Redis."""
-
-    SHORT_TERM_TTL_SECONDS = 60 * 60 * 24  # 24 hours
-
-    def __init__(self, client: redis.Redis):
-        self._client = client
-
-    @staticmethod
-    def _long_term_key(agent_id: str) -> str:
-        return f"dealbot:agent:{agent_id}:long_term"
-
-    @staticmethod
-    def _short_term_key(agent_id: str) -> str:
-        return f"dealbot:agent:{agent_id}:short_term"
-
-    def verify_connection(self) -> None:
-        self._client.ping()
-
-    def init_memory(
-        self,
-        agent_id: str,
-        *,
-        long_term: dict[str, Any],
-        short_term: dict[str, Any] | None = None,
-    ) -> None:
-        short_payload = short_term or {
-            "status": "initialized",
-            "messages": [],
-            "last_sent_message": None,
-            "last_reply_message": None,
-        }
-        self._client.set(self._long_term_key(agent_id), json.dumps(long_term))
-        self._client.setex(
-            self._short_term_key(agent_id),
-            self.SHORT_TERM_TTL_SECONDS,
-            json.dumps(short_payload),
-        )
-
-    def get_long_term(self, agent_id: str) -> dict[str, Any]:
-        raw = self._client.get(self._long_term_key(agent_id))
-        return json.loads(raw) if raw else {}
-
-    def get_short_term(self, agent_id: str) -> dict[str, Any]:
-        raw = self._client.get(self._short_term_key(agent_id))
-        return json.loads(raw) if raw else {}
-
-
-def _job_context() -> dict[str, Any]:
+def _job_context(
+    *,
+    product_name: str,
+    target_budget: float,
+    max_price: float,
+    listing_urls: list[str],
+) -> dict[str, Any]:
     return {
-        "product_name": PRODUCT_NAME,
-        "target_budget": TARGET_BUDGET,
-        "max_price": MAX_PRICE,
-        "listing_urls": LISTING_URLS,
+        "product_name": product_name,
+        "target_budget": target_budget,
+        "max_price": max_price,
+        "listing_urls": listing_urls,
     }
 
 
@@ -128,6 +52,8 @@ def _build_worker_long_term(
     worker_name: str,
     agent_id: str,
     listing: dict[str, Any],
+    *,
+    job_context: dict[str, Any],
 ) -> dict[str, Any]:
     return {
         "role": worker_name,
@@ -135,91 +61,187 @@ def _build_worker_long_term(
         "listing_url": listing.get("listing_url"),
         "browserbase_session_id": listing.get("browserbase_session_id"),
         "product": listing.get("data") or {},
-        "job": _job_context(),
+        "job": job_context,
     }
 
 
-def _build_manager_long_term(
-    agent_id: str,
-    assignments: list[dict[str, Any]],
-) -> dict[str, Any]:
-    return {
-        "role": "manager",
-        "agent_id": agent_id,
-        "job": _job_context(),
-        "assignments": assignments,
-        "lowest_price_seen": None,
-        "winning_listing_url": None,
-    }
-
-
-def _build_first_message(product: dict[str, Any]) -> str:
-    title = product.get("title") or PRODUCT_NAME
+def _build_first_message_fallback(
+    product: dict[str, Any],
+    *,
+    product_name: str,
+) -> str:
+    title = product.get("title") or product_name
     price = product.get("price") or "your listed price"
+    seller_name = product.get("seller_name")
     location = product.get("location")
+    greeting = f"Hi {seller_name}!" if seller_name else "Hi!"
 
     if location:
         return (
-            f"Hey! I saw your {title} for {price} in {location} and it looks great. "
+            f"{greeting} I saw your {title} for {price} in {location} and it looks great. "
             f"Is it still available?"
         )
     return (
-        f"Hey! I saw your {title} for {price} and it looks great. "
+        f"{greeting} I saw your {title} for {price} and it looks great. "
         f"Is it still available?"
     )
 
 
-async def initialize_agents() -> dict[str, Any]:
-    """
-    Scrape listings, assign one worker per listing, initialize Redis memory
-    for all 6 agents, and draft opening seller messages.
-    """
-    global WORKER_SESSION_IDS
+async def _generate_first_message(
+    product: dict[str, Any],
+    *,
+    product_name: str,
+) -> str:
+    title = product.get("title") or product_name
+    price = product.get("price") or "unknown"
+    description = (product.get("description") or "").strip()
+    seller_name = product.get("seller_name") or ""
+    location = product.get("location") or ""
+
+    prompt = SystemMessage(
+        content=f"""Write the first Facebook Marketplace message to a seller.
+
+Listing details:
+- Item: {title}
+- Price: {price}
+- Location: {location or "not listed"}
+- Seller name: {seller_name or "unknown"}
+- Description: {description or "not provided"}
+
+Rules:
+- Be kind, warm, and genuinely interested — sound like a real person, not a bot
+- Personalize using specific details from the listing (item name, location, description)
+- Use the seller's first name naturally if you have it
+- Keep it to 1-2 short sentences
+- Ask if the item is still available (or a natural variation)
+- Do NOT mention negotiating, lower prices, or other sellers
+- Do NOT use emojis
+- Output ONLY the message text to send. No quotes, labels, or explanation."""
+    )
+
+    try:
+        response = await model.ainvoke([prompt])
+        message = str(response.content).strip().strip('"').strip("'")
+        return message or _build_first_message_fallback(product, product_name=product_name)
+    except Exception:
+        return _build_first_message_fallback(product, product_name=product_name)
+
+
+async def initialize_agents(
+    *,
+    product_name: str,
+    target_budget: float,
+    max_price: float,
+    listing_urls: list[str],
+    send_openers: bool = True,
+    reply_wait_ms: int = 2500,
+) -> dict[str, Any]:
+    if not listing_urls:
+        raise ValueError("At least one listing URL is required")
+    if len(listing_urls) > 5:
+        raise ValueError("At most 5 listing URLs are allowed")
 
     load_dotenv()
 
+    worker_names = [f"worker{i}" for i in range(1, len(listing_urls) + 1)]
+    worker_agent_ids = {name: name for name in worker_names}
+    worker_session_ids: dict[str, str] = {}
+    job_context = _job_context(
+        product_name=product_name,
+        target_budget=target_budget,
+        max_price=max_price,
+        listing_urls=listing_urls,
+    )
+
     _log("Connecting to Redis…")
-    memory = AgentMemoryStore(_redis_client())
+    memory = AgentMemoryStore()
     try:
         await asyncio.to_thread(memory.verify_connection)
     except redis.ConnectionError as exc:
         raise RuntimeError(
-            "Cannot connect to Redis at "
-            f"{os.environ.get('REDIS_URL', DEFAULT_REDIS_URL)}. "
-            "Start local Redis with: docker compose up -d redis"
+            "Cannot connect to Redis. Start local Redis with: docker compose up -d redis"
         ) from exc
     _log("Redis connected.")
 
-    _log(f"Scraping {len(WORKER_NAMES)} listing(s) via Browserbase…")
+    _log(f"Scraping {len(worker_names)} listing(s) via Browserbase…")
     scraped = await initialize_browsers(
-        LISTING_URLS[: len(WORKER_NAMES)],
+        listing_urls,
         max_concurrency=2,
         scrape_timeout_s=120,
     )
-    if len(scraped) != len(WORKER_NAMES):
+    if len(scraped) != len(worker_names):
         raise RuntimeError(
-            f"Expected {len(WORKER_NAMES)} scraped listings, got {len(scraped)}"
+            f"Expected {len(worker_names)} scraped listings, got {len(scraped)}"
         )
 
     assignments: list[dict[str, Any]] = []
     opening_messages: dict[str, str] = {}
 
     _log("Writing agent memory to Redis…")
-    for worker_name, listing in zip(WORKER_NAMES, scraped, strict=True):
-        agent_id = WORKER_AGENT_IDS[worker_name]
-        session_id = listing.get("browserbase_session_id")
+    await asyncio.to_thread(memory.init_market_floor)
 
+    for worker_name, listing in zip(worker_names, scraped, strict=True):
+        agent_id = worker_agent_ids[worker_name]
+        session_id = listing.get("browserbase_session_id")
         if not session_id:
             raise RuntimeError(f"Missing browserbase_session_id for {worker_name}")
 
-        WORKER_SESSION_IDS[worker_name] = session_id
-
-        long_term = _build_worker_long_term(worker_name, agent_id, listing)
-        await asyncio.to_thread(memory.init_memory, agent_id, long_term=long_term)
-
+        worker_session_ids[worker_name] = session_id
         product = listing.get("data") or {}
-        first_message = _build_first_message(product)
+        listed_price = parse_price(product.get("price"))
+        opening_offer = (
+            max(target_budget, (listed_price or max_price) * 0.85)
+            if listed_price
+            else target_budget
+        )
+
+        long_term = _build_worker_long_term(
+            worker_name,
+            agent_id,
+            listing,
+            job_context=job_context,
+        )
+        await asyncio.to_thread(
+            memory.init_memory,
+            agent_id,
+            long_term=long_term,
+            short_term={
+                "status": "initialized",
+                "messages": [],
+                "last_sent_message": None,
+                "last_reply_message": None,
+                "current_min_price": opening_offer,
+            },
+        )
+
+        first_message = await _generate_first_message(
+            product,
+            product_name=product_name,
+        )
         opening_messages[worker_name] = first_message
+        _log(f"[{worker_name}] opener draft: {first_message}")
+        opener_reply: str | None = None
+
+        if send_openers:
+            _log(f"[{worker_name}] sending opener…")
+            chat = await send_listing_message(
+                session_id,
+                first_message,
+                reply_wait_ms=reply_wait_ms,
+            )
+            opener_reply = chat.get("reply_message")
+            await asyncio.to_thread(
+                memory.record_exchange,
+                agent_id,
+                sent_message=first_message,
+                reply_message=opener_reply,
+                current_min_price=opening_offer,
+                status="negotiating",
+            )
+            _log(
+                f"[{worker_name}] opener sent"
+                + (f", seller replied: {opener_reply!r}" if opener_reply else ", no reply yet")
+            )
 
         assignments.append(
             {
@@ -229,44 +251,75 @@ async def initialize_agents() -> dict[str, Any]:
                 "listing_url": listing.get("listing_url"),
                 "product": product,
                 "first_message": first_message,
+                "opener_reply": opener_reply,
+                "current_min_price": opening_offer,
             }
         )
 
-    await asyncio.to_thread(
-        memory.init_memory,
-        MANAGER_AGENT_ID,
-        long_term=_build_manager_long_term(MANAGER_AGENT_ID, assignments),
-        short_term={
-            "status": "initialized",
-            "active_workers": WORKER_NAMES,
-            "broadcasts": [],
-            "messages": [],
-        },
-    )
+        if listed_price is not None:
+            await asyncio.to_thread(
+                memory.set_global_lowest_price,
+                listed_price,
+                worker_id=worker_name,
+                listing_url=listing.get("listing_url", ""),
+            )
 
     print("\nAgent assignments initialized:")
-    print(f"  Manager agent id : {MANAGER_AGENT_ID}")
     for item in assignments:
         print(f"\n  {item['worker_name']} -> {item['agent_id']}")
         print(f"    session id     : {item['browserbase_session_id']}")
         print(f"    listing        : {item['listing_url']}")
         print(f"    product        : {item['product'].get('title')} — {item['product'].get('price')}")
         print(f"    first message  : {item['first_message']}")
+        if item.get("opener_reply"):
+            print(f"    seller reply   : {item['opener_reply']}")
 
-        # chat = await send_listing_message(
-        #     item["browserbase_session_id"],
-        #     item["first_message"],
-        # )
-        # print(f"    seller reply   : {chat['reply_message']}")
+    floor = await asyncio.to_thread(memory.get_market_floor)
+    if floor.get("lowest_price_seen") is not None:
+        print(
+            f"\n  Shared market floor: ${floor['lowest_price_seen']} "
+            f"(from {floor.get('winning_worker_id')})"
+        )
 
     return {
-        "manager_agent_id": MANAGER_AGENT_ID,
-        "worker_agent_ids": dict(WORKER_AGENT_IDS),
-        "worker_session_ids": dict(WORKER_SESSION_IDS),
+        "worker_agent_ids": worker_agent_ids,
+        "worker_session_ids": worker_session_ids,
+        "market_floor": floor,
         "assignments": assignments,
         "opening_messages": opening_messages,
     }
 
 
+async def run_dealbot(
+    *,
+    product_name: str,
+    target_budget: float,
+    max_price: float,
+    listing_urls: list[str],
+) -> dict[str, Any]:
+    from orchestration import launch_negotiation
+
+    init_result = await initialize_agents(
+        product_name=product_name,
+        target_budget=target_budget,
+        max_price=max_price,
+        listing_urls=listing_urls,
+        send_openers=True,
+    )
+    _log("Starting negotiation loops…")
+    negotiation_results = await launch_negotiation(init_result["assignments"])
+    return {
+        "initialization": init_result,
+        "negotiation": negotiation_results,
+    }
+
+
 if __name__ == "__main__":
-    asyncio.run(initialize_agents())
+    asyncio.run(
+        run_dealbot(
+            product_name=DEFAULT_PRODUCT_NAME,
+            target_budget=DEFAULT_TARGET_BUDGET,
+            max_price=DEFAULT_MAX_PRICE,
+            listing_urls=DEFAULT_LISTING_URLS,
+        )
+    )
