@@ -1,0 +1,12 @@
+/* ==========================================================================
+   index.css — Global stylesheet entry point
+   Partials are inlined first via postcss-import, then Tailwind layers load.
+   ========================================================================== */
+
+@import './styles/base.css';
+@import './styles/layout.css';
+@import './styles/forms.css';
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;

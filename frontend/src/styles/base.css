@@ -1,0 +1,62 @@
+/* ==========================================================================
+   base.css — Global resets, typography, and document defaults
+   Theme: black canvas + sage green accent
+   ========================================================================== */
+
+@layer base {
+  :root {
+    --font-display: 'Bricolage Grotesque', sans-serif;
+    --font-body: 'Plus Jakarta Sans', sans-serif;
+    --font-mono: 'JetBrains Mono', monospace;
+
+    --green-accent: #6b8f71;
+    --green-accent-light: #8fae94;
+    --green-accent-dark: #4f6b54;
+
+    --color-bg: #07090a;
+    --color-bg-elevated: #0c1012;
+    --color-bg-subtle: rgba(107, 143, 113, 0.04);
+    --color-bg-muted: rgba(255, 255, 255, 0.03);
+    --color-text: #e2e8f0;
+    --color-text-secondary: rgba(255, 255, 255, 0.55);
+    --color-text-muted: rgba(255, 255, 255, 0.35);
+    --color-text-faint: rgba(255, 255, 255, 0.22);
+    --color-border: rgba(255, 255, 255, 0.08);
+    --color-border-strong: rgba(255, 255, 255, 0.12);
+    --color-accent: var(--green-accent);
+    --color-accent-bright: var(--green-accent-light);
+    --color-accent-hover: var(--green-accent-light);
+    --color-accent-dark: var(--green-accent-dark);
+    --color-accent-soft: rgba(107, 143, 113, 0.14);
+    --color-accent-softer: rgba(107, 143, 113, 0.06);
+    --color-accent-text: var(--green-accent-light);
+    --color-disabled-bg: rgba(255, 255, 255, 0.06);
+    --color-track: rgba(255, 255, 255, 0.08);
+    --color-dot-idle: rgba(255, 255, 255, 0.14);
+    --color-footer-bg: rgba(7, 9, 10, 0.94);
+  }
+
+  body {
+    margin: 0;
+    min-height: 100vh;
+    background: var(--color-bg);
+    font-family: var(--font-body);
+    font-weight: 400;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    color: var(--color-text);
+  }
+
+  h1,
+  h2 {
+    font-family: var(--font-display);
+    font-weight: 700;
+  }
+
+  button,
+  input,
+  textarea,
+  select {
+    font-family: var(--font-body);
+  }
+}
