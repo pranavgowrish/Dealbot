@@ -709,6 +709,190 @@
     @apply text-[11px];
     color: var(--color-accent);
   }
+
+  /* ── LIVE AGENTIC GRAPH ── */
+  .agentic-view {
+    @apply mx-auto mt-8 flex w-full max-w-6xl flex-col gap-4;
+  }
+
+  .agentic-header {
+    @apply flex flex-wrap items-end justify-between gap-3 rounded-2xl p-4;
+    background: var(--color-bg-elevated);
+    border: 1px solid var(--color-border);
+  }
+
+  .agentic-eyebrow {
+    @apply text-[10px] uppercase tracking-[0.16em];
+    font-family: var(--font-mono);
+    color: var(--color-accent);
+  }
+
+  .agentic-title {
+    @apply mt-1 text-lg;
+    font-family: var(--font-display);
+    font-weight: 700;
+    color: var(--color-text);
+  }
+
+  .agentic-subtitle {
+    @apply mt-1 text-xs;
+    color: var(--color-text-secondary);
+  }
+
+  .agentic-connection-badges {
+    @apply flex flex-wrap gap-2;
+  }
+
+  .agentic-badge {
+    @apply rounded-full px-2.5 py-1 text-[10px];
+    border: 1px solid var(--color-border);
+    background: var(--color-bg-muted);
+    color: var(--color-text-muted);
+    font-family: var(--font-mono);
+  }
+
+  .agentic-badge--connected {
+    color: var(--color-accent);
+    border-color: rgba(107, 143, 113, 0.4);
+  }
+
+  .agentic-badge--connecting {
+    color: var(--color-accent-text);
+  }
+
+  .agentic-badge--error {
+    color: #f4b0b0;
+    border-color: rgba(244, 140, 140, 0.4);
+  }
+
+  .agentic-grid {
+    @apply grid gap-4;
+    grid-template-columns: 1.8fr 1fr;
+  }
+
+  .agentic-graph-shell {
+    @apply relative overflow-hidden rounded-2xl;
+    min-height: 620px;
+    border: 1px solid var(--color-border);
+    background:
+      radial-gradient(circle at 50% 20%, rgba(107, 143, 113, 0.08), transparent 55%),
+      var(--color-bg-elevated);
+  }
+
+  .agentic-edge-layer {
+    @apply absolute inset-0 h-full w-full;
+  }
+
+  .agentic-edge {
+    stroke: rgba(107, 143, 113, 0.2);
+    stroke-width: 0.35;
+  }
+
+  .agentic-edge--active {
+    stroke: rgba(143, 174, 148, 0.65);
+    animation: agentEdgePulse 1.5s ease-in-out infinite;
+  }
+
+  .agent-node {
+    @apply absolute flex w-[210px] -translate-x-1/2 -translate-y-1/2 flex-col gap-1 rounded-xl p-3;
+    border: 1px solid var(--color-border);
+    background: rgba(18, 21, 23, 0.96);
+    box-shadow: 0 8px 22px rgba(0, 0, 0, 0.35);
+  }
+
+  .agent-node--manager {
+    width: 240px;
+    border-color: rgba(107, 143, 113, 0.45);
+    box-shadow: 0 0 0 1px rgba(107, 143, 113, 0.2);
+  }
+
+  .agent-node--success {
+    border-color: rgba(107, 143, 113, 0.5);
+    background: rgba(15, 26, 18, 0.96);
+  }
+
+  .agent-node--killed {
+    border-color: rgba(145, 145, 145, 0.3);
+    background: rgba(60, 60, 60, 0.3);
+    color: rgba(205, 205, 205, 0.55);
+  }
+
+  .agent-node-role {
+    @apply text-[9px] uppercase tracking-[0.16em];
+    color: var(--color-text-muted);
+    font-family: var(--font-mono);
+  }
+
+  .agent-node-title {
+    @apply text-xs font-semibold;
+    color: var(--color-accent-text);
+  }
+
+  .agent-node-copy {
+    @apply text-[11px] leading-snug;
+    color: var(--color-text-secondary);
+  }
+
+  .agent-node-copy--muted {
+    color: var(--color-text-faint);
+  }
+
+  .agent-node-last-message {
+    @apply mt-1 rounded-md px-2 py-1 text-[10px];
+    border: 1px solid rgba(107, 143, 113, 0.3);
+    background: rgba(107, 143, 113, 0.08);
+    color: var(--color-text-secondary);
+  }
+
+  .agent-edge-pulse {
+    @apply mt-1 rounded-full px-2 py-0.5 text-[9px];
+    border: 1px solid rgba(107, 143, 113, 0.4);
+    background: rgba(107, 143, 113, 0.15);
+    color: var(--color-accent-text);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .agentic-log-panel {
+    @apply rounded-2xl p-4;
+    border: 1px solid var(--color-border);
+    background: var(--color-bg-elevated);
+  }
+
+  .agentic-log-heading {
+    @apply mb-3 text-[10px] uppercase tracking-[0.16em];
+    color: var(--color-accent);
+    font-family: var(--font-mono);
+  }
+
+  .agentic-log-empty {
+    @apply text-xs;
+    color: var(--color-text-faint);
+  }
+
+  .agentic-log-list {
+    @apply m-0 flex list-none flex-col gap-2 p-0;
+    max-height: 560px;
+    overflow-y: auto;
+  }
+
+  .agentic-log-item {
+    @apply rounded-lg px-2.5 py-2 text-[11px] leading-snug;
+    background: var(--color-bg-muted);
+    border: 1px solid var(--color-border);
+    color: var(--color-text-secondary);
+  }
+
+  @media (max-width: 1100px) {
+    .agentic-grid {
+      grid-template-columns: 1fr;
+    }
+
+    .agentic-graph-shell {
+      min-height: 700px;
+    }
+  }
 }
 
 @keyframes shimmer {
@@ -736,6 +920,16 @@
   }
   to {
     transform: translateX(-50%);
+  }
+}
+
+@keyframes agentEdgePulse {
+  0%,
+  100% {
+    stroke-opacity: 0.65;
+  }
+  50% {
+    stroke-opacity: 1;
   }
 }
 

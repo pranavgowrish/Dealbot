@@ -1,5 +1,5 @@
 """
-Facebook Marketplace automation via local Stagehand sessions.
+Facebook Marketplace automation via Stagehand sessions.
 
 Required environment variables:
     MODEL_API_KEY
@@ -7,9 +7,13 @@ Required environment variables:
 Optional environment variables:
     STAGEHAND_CONTEXT_ID       (persistent profile/context ID)
     BROWSERBASE_CONTEXT_ID     (legacy fallback for context ID)
+    STAGEHAND_USE_BROWSERBASE_CONTEXT (defaults to false; use Browserbase context mode)
+    BROWSERBASE_API_KEY        (required when Browserbase context mode is enabled)
+    BROWSERBASE_PROJECT_ID     (required when Browserbase context mode is enabled)
     STAGEHAND_LOCAL_HEADLESS   (defaults to false)
     STAGEHAND_KEEP_OPEN_ON_DONE (defaults to false; debugging aid)
     STAGEHAND_AUTO_RECLAIM_CONTEXT (defaults to true)
+    STAGEHAND_LOCAL_CLONE_SHARED_CONTEXTS (defaults to true)
 """
 
 from __future__ import annotations
@@ -22,12 +26,14 @@ import asyncio
 import hashlib
 import errno
 import shutil
+from contextlib import asynccontextmanager
 from pathlib import Path
 import socket
 import subprocess
 import time
 from typing import Any
 
+from browserbase import Browserbase
 from dotenv import load_dotenv
 from stagehand import AsyncStagehand, APIResponseValidationError
 
@@ -77,6 +83,7 @@ _ITEM_ID_RE = re.compile(r"(?:listing\s+)?(\d{10,})")
 _A11Y_REF_RE = re.compile(r"^\[?\d+-\d+\]?$")
 _CONTEXT_ID_SAFE_RE = re.compile(r"[^a-zA-Z0-9_.-]+")
 _CONTEXTS_ROOT = Path(__file__).resolve().parent / ".stagehand_contexts"
+_BROWSERBASE_CONTEXT_PREFIX = "browserbase-context:"
 
 
 def _slugify_context_id(raw: str) -> str:
@@ -109,6 +116,36 @@ def _resolve_stagehand_context_id(
     return _slugify_context_id(candidate)
 
 
+def _resolve_browserbase_context_id(context_id: str | None = None) -> str:
+    candidate = (
+        context_id
+        or os.environ.get("STAGEHAND_CONTEXT_ID")
+        or os.environ.get("BROWSERBASE_CONTEXT_ID")
+    )
+    if not candidate:
+        raise RuntimeError(
+            "Browserbase context mode requires STAGEHAND_CONTEXT_ID "
+            "(or BROWSERBASE_CONTEXT_ID) to be set to a pre-authenticated context ID."
+        )
+    raw = candidate.strip()
+    if raw.startswith(_BROWSERBASE_CONTEXT_PREFIX):
+        return raw[len(_BROWSERBASE_CONTEXT_PREFIX) :]
+    return raw
+
+
+def _encode_context_ref(context_id: str, *, browserbase_context_mode: bool) -> str:
+    if browserbase_context_mode:
+        return f"{_BROWSERBASE_CONTEXT_PREFIX}{context_id}"
+    return context_id
+
+
+def _decode_context_ref(context_ref: str | None) -> tuple[bool, str]:
+    raw = (context_ref or "").strip()
+    if raw.startswith(_BROWSERBASE_CONTEXT_PREFIX):
+        return True, raw[len(_BROWSERBASE_CONTEXT_PREFIX) :]
+    return False, raw
+
+
 def _context_user_data_dir(context_id: str) -> Path:
     _CONTEXTS_ROOT.mkdir(parents=True, exist_ok=True)
     context_dir = _CONTEXTS_ROOT / context_id
@@ -118,6 +155,10 @@ def _context_user_data_dir(context_id: str) -> Path:
 
 def _should_seed_listing_contexts() -> bool:
     return _env_bool("STAGEHAND_SEED_LISTING_CONTEXTS", True)
+
+
+def _should_clone_shared_local_contexts() -> bool:
+    return _env_bool("STAGEHAND_LOCAL_CLONE_SHARED_CONTEXTS", True)
 
 
 def _is_context_dir_effectively_empty(context_dir: Path) -> bool:
@@ -172,6 +213,42 @@ def _seed_context_from_primary_profile(context_id: str) -> None:
             continue
 
 
+def _clone_local_context_from_base(base_context_id: str, clone_context_id: str) -> None:
+    resolved_base_id = _slugify_context_id(base_context_id)
+    resolved_clone_id = _slugify_context_id(clone_context_id)
+    if resolved_base_id == resolved_clone_id:
+        return
+
+    source_dir = _context_user_data_dir(resolved_base_id)
+    if not source_dir.exists() or _is_context_dir_effectively_empty(source_dir):
+        raise RuntimeError(
+            "Cannot clone local Stagehand context because the base profile is empty. "
+            "Log in once with STAGEHAND_CONTEXT_ID set to the base context, then retry."
+        )
+
+    target_dir = _context_user_data_dir(resolved_clone_id)
+    if not _is_context_dir_effectively_empty(target_dir):
+        return
+
+    skip_names = {
+        "SingletonLock",
+        "SingletonSocket",
+        "SingletonCookie",
+        "chrome.pid",
+    }
+    for entry in source_dir.iterdir():
+        if entry.name in skip_names:
+            continue
+        destination = target_dir / entry.name
+        try:
+            if entry.is_dir():
+                shutil.copytree(entry, destination, dirs_exist_ok=True)
+            else:
+                shutil.copy2(entry, destination)
+        except OSError:
+            continue
+
+
 def _env_bool(name: str, default: bool) -> bool:
     raw = os.environ.get(name)
     if raw is None:
@@ -184,6 +261,54 @@ def _env_bool(name: str, default: bool) -> bool:
 
 def _local_headless() -> bool:
     return _env_bool("STAGEHAND_LOCAL_HEADLESS", False)
+
+
+def _use_browserbase_context_mode() -> bool:
+    return _env_bool("STAGEHAND_USE_BROWSERBASE_CONTEXT", False)
+
+
+def _browserbase_api_key() -> str:
+    api_key = os.environ.get("BROWSERBASE_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError(
+            "BROWSERBASE_API_KEY is required when STAGEHAND_USE_BROWSERBASE_CONTEXT=true."
+        )
+    return api_key
+
+
+def _browserbase_project_id() -> str:
+    project_id = os.environ.get("BROWSERBASE_PROJECT_ID", "").strip()
+    if not project_id:
+        raise RuntimeError(
+            "BROWSERBASE_PROJECT_ID is required when STAGEHAND_USE_BROWSERBASE_CONTEXT=true."
+        )
+    return project_id
+
+
+def _create_browserbase_context() -> str:
+    browserbase = Browserbase(api_key=_browserbase_api_key())
+    created = browserbase.contexts.create(project_id=_browserbase_project_id())
+    context_id = getattr(created, "id", None)
+    if not context_id:
+        raise RuntimeError("Browserbase context creation returned no context ID.")
+    return str(context_id)
+
+
+def _create_browserbase_session_id(context_id: str, *, persist: bool) -> str:
+    browserbase = Browserbase(api_key=_browserbase_api_key())
+    created = browserbase.sessions.create(
+        project_id=_browserbase_project_id(),
+        browser_settings={
+            "context": {
+                "id": context_id,
+                "persist": persist,
+            }
+        },
+    )
+    session_id = getattr(created, "id", None)
+    if not session_id:
+        raise RuntimeError("Browserbase session creation returned no session ID.")
+    return str(session_id)
 
 
 def _build_local_browser_config(context_id: str) -> dict[str, Any]:
@@ -330,22 +455,33 @@ def _stagehand_client_config(
     *,
     timeout: float | None = None,
     keep_browser_open: bool | None = None,
+    use_browserbase_context: bool = False,
 ) -> dict[str, Any]:
     shutdown_on_close = (
         not keep_browser_open
         if keep_browser_open is not None
         else not _keep_open_on_done()
     )
-    config: dict[str, Any] = {
-        "server": "local",
-        "_strict_response_validation": True,
-        "model_api_key": os.environ["MODEL_API_KEY"],
-        # AsyncStagehand defaults this to True. Set explicitly so headful mode
-        # actually opens visible windows when STAGEHAND_LOCAL_HEADLESS=false.
-        "local_headless": _local_headless(),
-        # Useful for debugging with headful mode where you want to inspect state.
-        "local_shutdown_on_close": shutdown_on_close,
-    }
+    config: dict[str, Any]
+    if use_browserbase_context:
+        config = {
+            "server": "remote",
+            "_strict_response_validation": True,
+            "model_api_key": os.environ["MODEL_API_KEY"],
+            "browserbase_api_key": _browserbase_api_key(),
+            "browserbase_project_id": _browserbase_project_id(),
+        }
+    else:
+        config = {
+            "server": "local",
+            "_strict_response_validation": True,
+            "model_api_key": os.environ["MODEL_API_KEY"],
+            # AsyncStagehand defaults this to True. Set explicitly so headful mode
+            # actually opens visible windows when STAGEHAND_LOCAL_HEADLESS=false.
+            "local_headless": _local_headless(),
+            # Useful for debugging with headful mode where you want to inspect state.
+            "local_shutdown_on_close": shutdown_on_close,
+        }
     if timeout is not None:
         config["timeout"] = timeout
     return config
@@ -542,6 +678,61 @@ def _price_to_float(price: str) -> float | None:
         return None
 
 
+def _listing_extract_timeout_s() -> float:
+    raw = os.environ.get("STAGEHAND_LISTING_EXTRACT_TIMEOUT_S", "35").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        value = 35.0
+    return max(5.0, value)
+
+
+def _listing_extract_retries() -> int:
+    raw = os.environ.get("STAGEHAND_LISTING_EXTRACT_RETRIES", "2").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 2
+    return max(1, value)
+
+
+def _minimal_listing_data(link: str) -> dict[str, str]:
+    item_id = _listing_item_id(link) or "unknown"
+    return {
+        "title": f"Marketplace listing {item_id}",
+        "price": "Unknown",
+        "description": "",
+        "condition": "",
+        "seller_name": "seller",
+        "location": "unknown",
+        "date_listed": "",
+        "reason_for_selling": "",
+    }
+
+
+def _merge_listing_data(primary: dict[str, Any] | None, link: str) -> dict[str, str]:
+    merged = _minimal_listing_data(link)
+    if not isinstance(primary, dict):
+        return merged
+
+    for key in (
+        "title",
+        "price",
+        "description",
+        "condition",
+        "seller_name",
+        "location",
+        "date_listed",
+        "reason_for_selling",
+    ):
+        value = primary.get(key)
+        if isinstance(value, str):
+            text = value.strip()
+            if text:
+                merged[key] = text
+    return merged
+
+
 def _normalize_listings(
     raw: Any,
     price_min: float,
@@ -633,8 +824,11 @@ LISTING_SCHEMA: dict[str, Any] = {
         "title": {"type": "string"},
         "price": {"type": "string"},
         "description": {"type": "string"},
+        "condition": {"type": "string"},
         "seller_name": {"type": "string"},
         "location": {"type": "string"},
+        "date_listed": {"type": "string"},
+        "reason_for_selling": {"type": "string"},
     },
     "required": ["title", "price", "description", "seller_name", "location"],
 }
@@ -719,17 +913,22 @@ set screenW to (x1 - x0)
 set screenH to (y1 - y0)
 set halfW to (screenW div 2)
 set halfH to (screenH div 2)
+set fifthW to ((screenW * 7) div 10)
+set fifthH to ((screenH * 7) div 10)
+set fifthLeft to x0 + ((screenW - fifthW) div 2)
+set fifthTop to y0 + ((screenH - fifthH) div 2)
 
 set placements to {¬
     {x0, y0, x0 + halfW, y0 + halfH}, ¬
     {x0 + halfW, y0, x0 + screenW, y0 + halfH}, ¬
     {x0, y0 + halfH, x0 + halfW, y0 + screenH}, ¬
-    {x0 + halfW, y0 + halfH, x0 + screenW, y0 + screenH}}
+    {x0 + halfW, y0 + halfH, x0 + screenW, y0 + screenH}, ¬
+    {fifthLeft, fifthTop, fifthLeft + fifthW, fifthTop + fifthH}}
 
 tell application "Google Chrome"
     set winCount to count of windows
     set targetCount to winCount
-    if targetCount > 4 then set targetCount to 4
+    if targetCount > 5 then set targetCount to 5
     repeat with i from 1 to targetCount
         set bounds of window i to item i of placements
     end repeat
@@ -983,9 +1182,100 @@ async def _send_message_and_confirm(
     return False
 
 
+async def _start_stagehand_session(
+    *,
+    client: AsyncStagehand,
+    model_name: str,
+    context_id: str,
+    use_browserbase_context: bool,
+    persist_context: bool = False,
+) -> Any:
+    if use_browserbase_context:
+        browserbase_session_id = await asyncio.to_thread(
+            _create_browserbase_session_id,
+            context_id,
+            persist=persist_context,
+        )
+        session = await client.sessions.start(
+            model_name=model_name,
+            browserbase_session_id=browserbase_session_id,
+        )
+    else:
+        _prepare_context_for_launch(context_id)
+        session = await client.sessions.start(
+            model_name=model_name,
+            browser=_build_local_browser_config(context_id),
+        )
+    if not session.id:
+        raise RuntimeError(f"Expected session ID, got {session!r}")
+    return session
+
+
+@asynccontextmanager
+async def _noop_async_context_manager():
+    yield
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
+async def generate_browserbase_login_context(
+    *,
+    context_id: str | None = None,
+    model_name: str = "anthropic/claude-sonnet-4-6",
+    login_url: str = "https://www.facebook.com/login",
+) -> str:
+    """
+    One-time setup helper:
+      1) create (or reuse) a Browserbase context
+      2) start a persist=true session
+      3) navigate to login page and wait for manual login confirmation
+      4) close session so cookies/tokens are saved to context storage
+    """
+    load_dotenv()
+    resolved_context_id = (
+        context_id.strip()
+        if context_id and context_id.strip()
+        else await asyncio.to_thread(_create_browserbase_context)
+    )
+    print(
+        "Browserbase auth context ready. "
+        f"Use this in workers: {resolved_context_id}",
+        flush=True,
+    )
+
+    async with AsyncStagehand(
+        **_stagehand_client_config(use_browserbase_context=True)
+    ) as client:
+        session = await _start_stagehand_session(
+            client=client,
+            model_name=model_name,
+            context_id=resolved_context_id,
+            use_browserbase_context=True,
+            persist_context=True,
+        )
+        try:
+            await session.navigate(
+                url=login_url,
+                options={"wait_until": "domcontentloaded"},
+            )
+            print(
+                "Complete login in this session, then press Enter to persist auth.",
+                flush=True,
+            )
+            try:
+                await asyncio.to_thread(input)
+            except EOFError:
+                # Non-interactive environments can still persist whatever state exists.
+                pass
+        finally:
+            try:
+                await session.end()
+            except Exception:
+                pass
+    return resolved_context_id
+
 
 async def search_marketplace(
     item_description: str,
@@ -1098,6 +1388,7 @@ async def _scrape_listing(
     model_name: str,
     context_id: str | None = None,
     persistent_session: bool = False,
+    use_browserbase_context: bool = False,
 ) -> dict[str, Any]:
     """
     Creates one local Stagehand session, opens the page,
@@ -1105,51 +1396,72 @@ async def _scrape_listing(
     """
     load_dotenv()
 
-    resolved_context_id = _resolve_stagehand_context_id(context_id, listing_url=link)
+    resolved_context_id = (
+        _resolve_browserbase_context_id(context_id)
+        if use_browserbase_context
+        else _resolve_stagehand_context_id(context_id, listing_url=link)
+    )
+    encoded_context_ref = _encode_context_ref(
+        resolved_context_id,
+        browserbase_context_mode=use_browserbase_context,
+    )
+
+    if persistent_session and use_browserbase_context:
+        raise RuntimeError(
+            "persistent_session is not supported in Browserbase context mode."
+        )
 
     if persistent_session:
         _, session = await _get_or_create_active_listing_session(
             context_id=resolved_context_id,
             model_name=model_name,
         )
-        data = await _extract_listing_from_open_session(
-            session=session,
-            link=link,
-            model_name=model_name,
-        )
-        return {
-            "stagehand_context_id": resolved_context_id,
-            # Backward compatibility for older orchestrator code paths.
-            "browserbase_session_id": resolved_context_id,
-            "listing_url": link,
-            "data": data,
-        }
-
-    async with AsyncStagehand(**_stagehand_client_config()) as client:
-        try:
-            _prepare_context_for_launch(resolved_context_id)
-            session = await client.sessions.start(
-                model_name=model_name,
-                browser=_build_local_browser_config(resolved_context_id),
-            )
-        except APIResponseValidationError as e:
-            print(f"Session schema error — HTTP {e.response.status_code}")
-            print(e.response.text)
-            raise
-
-        if not session.id:
-            raise RuntimeError(f"Expected session ID, got {session!r}")
-
         try:
             data = await _extract_listing_from_open_session(
                 session=session,
                 link=link,
                 model_name=model_name,
             )
+        except Exception as exc:
+            _debug_print(_listing_id(link), f"listing scrape failed, using fallback: {exc}")
+            data = _minimal_listing_data(link)
+        return {
+            "stagehand_context_id": encoded_context_ref,
+            # Backward compatibility for older orchestrator code paths.
+            "browserbase_session_id": encoded_context_ref,
+            "listing_url": link,
+            "data": data,
+        }
+
+    async with AsyncStagehand(
+        **_stagehand_client_config(use_browserbase_context=use_browserbase_context)
+    ) as client:
+        try:
+            session = await _start_stagehand_session(
+                client=client,
+                model_name=model_name,
+                context_id=resolved_context_id,
+                use_browserbase_context=use_browserbase_context,
+            )
+        except APIResponseValidationError as e:
+            print(f"Session schema error — HTTP {e.response.status_code}")
+            print(e.response.text)
+            raise
+
+        try:
+            try:
+                data = await _extract_listing_from_open_session(
+                    session=session,
+                    link=link,
+                    model_name=model_name,
+                )
+            except Exception as exc:
+                _debug_print(_listing_id(link), f"listing scrape failed, using fallback: {exc}")
+                data = _minimal_listing_data(link)
             return {
-                "stagehand_context_id": resolved_context_id,
+                "stagehand_context_id": encoded_context_ref,
                 # Backward compatibility for older orchestrator code paths.
-                "browserbase_session_id": resolved_context_id,
+                "browserbase_session_id": encoded_context_ref,
                 "listing_url": link,
                 "data": data,
             }
@@ -1180,28 +1492,42 @@ async def _extract_listing_from_open_session(
     label = _listing_id(link)
     _debug_print(label, "navigated, extracting listing data…")
 
-    response = await session.extract(
-        instruction=(
-            "Extract the Facebook Marketplace listing details "
-            "visible on this page."
-        ),
-        schema=LISTING_SCHEMA,
-        options={"model": model_name},
-    )
+    extract_timeout_s = _listing_extract_timeout_s()
+    max_attempts = _listing_extract_retries()
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = await asyncio.wait_for(
+                session.extract(
+                    instruction=(
+                        "Extract the Facebook Marketplace listing details visible on this page, "
+                        "including title, price, description, condition, seller name, and location. "
+                        "If visible, also extract date_listed text (for example: 'listed 2 weeks ago') "
+                        "and reason_for_selling from the listing description or seller notes; "
+                        "otherwise use an empty string for optional fields."
+                    ),
+                    schema=LISTING_SCHEMA,
+                    options={"model": model_name},
+                ),
+                timeout=extract_timeout_s,
+            )
+            raw_data = _to_dict(response.data.result if response.data else None)
+            data = _merge_listing_data(raw_data, link)
+            _debug_print(
+                label,
+                f"{data.get('title', '?')} — {data.get('price', '?')} "
+                f"({data.get('location', '?')})",
+            )
+            return data
+        except Exception as exc:
+            _debug_print(
+                label,
+                f"extract attempt {attempt}/{max_attempts} failed: {exc}",
+            )
+            if attempt < max_attempts:
+                await asyncio.sleep(0.4)
 
-    data = _to_dict(response.data.result if response.data else None)
-    if data:
-        _debug_print(
-            label,
-            f"{data.get('title', '?')} — {data.get('price', '?')} "
-            f"({data.get('location', '?')})",
-        )
-    else:
-        _debug_print(
-            label,
-            f"extract returned no data (success={response.success})",
-        )
-    return data
+    _debug_print(label, "extract failed; using minimal fallback listing payload.")
+    return _minimal_listing_data(link)
 
 
 async def _start_persistent_listing_session(
@@ -1253,6 +1579,38 @@ async def _get_or_create_active_listing_session(
     return client, session
 
 
+async def close_active_listing_browser(stagehand_context_id: str) -> bool:
+    """
+    Close a persistent local listing browser session for a worker context.
+    Returns True when a live persistent bundle existed and was closed.
+    """
+    browserbase_mode, decoded_context_id = _decode_context_ref(stagehand_context_id)
+    if browserbase_mode:
+        # Current persistent reuse tracking is local-context only.
+        return False
+
+    resolved_context_id = _resolve_stagehand_context_id(decoded_context_id)
+    active_bundle = _ACTIVE_LISTING_SESSIONS.pop(resolved_context_id, None)
+    if not active_bundle:
+        return False
+
+    session = active_bundle.get("session")
+    client = active_bundle.get("client")
+    try:
+        if session is not None:
+            await session.end()
+    except Exception:
+        pass
+    try:
+        if client is not None:
+            await client.__aexit__(None, None, None)
+    except Exception:
+        pass
+
+    _CONTEXT_SEND_LOCKS.pop(resolved_context_id, None)
+    return True
+
+
 async def _scrape_listings_with_shared_session(
     *,
     links: list[str],
@@ -1297,9 +1655,14 @@ async def _scrape_listings_with_shared_session(
                         timeout=scrape_timeout_s,
                     )
                 except asyncio.TimeoutError as exc:
-                    raise RuntimeError(
-                        f"Scrape timed out after {scrape_timeout_s:.0f}s for {link}"
-                    ) from exc
+                    _debug_print(
+                        label,
+                        f"shared scrape timed out after {scrape_timeout_s:.0f}s; using fallback.",
+                    )
+                    data = _minimal_listing_data(link)
+                except Exception as exc:
+                    _debug_print(label, f"shared scrape failed; using fallback: {exc}")
+                    data = _minimal_listing_data(link)
 
                 results.append(
                     {
@@ -1335,31 +1698,68 @@ async def initialize_browsers(
     keep_windows_open: bool = False,
 ) -> list[dict[str, Any]]:
     """
-    Launches one local Stagehand session per URL
+    Launches one Stagehand session per URL
     and scrapes all pages concurrently.
     """
     load_dotenv()
 
     print(f"Scraping {len(links)} listing(s)…", flush=True)
 
-    shared_context_id = None
+    shared_context_id: str | None = None
     if use_shared_context:
         shared_context_id = (
             context_id
             or os.environ.get("STAGEHAND_CONTEXT_ID")
             or os.environ.get("BROWSERBASE_CONTEXT_ID")
         )
-
-    effective_concurrency = max(1, max_concurrency)
-    if shared_context_id and effective_concurrency > 1:
+    per_link_context_overrides: dict[str, str] = {}
+    browserbase_shared_context_mode = bool(
+        shared_context_id and _use_browserbase_context_mode()
+    )
+    if browserbase_shared_context_mode:
         print(
-            "Shared Stagehand context detected; forcing max_concurrency=1 "
-            "to avoid local profile lock conflicts.",
+            "Using Browserbase shared context mode (persist=false workers) "
+            "for concurrent listings.",
             flush=True,
         )
-        effective_concurrency = 1
 
-    if shared_context_id:
+    effective_concurrency = max(1, max_concurrency)
+    if (
+        shared_context_id
+        and not browserbase_shared_context_mode
+        and effective_concurrency > 1
+    ):
+        if _should_clone_shared_local_contexts():
+            resolved_shared_context_id = _resolve_stagehand_context_id(shared_context_id)
+            print(
+                "Shared local context detected; cloning it into isolated "
+                "per-listing profiles for concurrent runs.",
+                flush=True,
+            )
+            for index, link in enumerate(links, start=1):
+                listing_context = _context_id_from_listing_url(link) or f"listing-{index}"
+                cloned_context_id = _slugify_context_id(
+                    f"{resolved_shared_context_id}-{listing_context}"
+                )
+                _clone_local_context_from_base(
+                    resolved_shared_context_id,
+                    cloned_context_id,
+                )
+                per_link_context_overrides[link] = cloned_context_id
+        else:
+            print(
+                "Shared Stagehand context detected; forcing max_concurrency=1 "
+                "to avoid local profile lock conflicts.",
+                flush=True,
+            )
+            effective_concurrency = 1
+
+    if (
+        shared_context_id
+        and not browserbase_shared_context_mode
+        and not per_link_context_overrides
+        and not keep_windows_open
+    ):
         results = await _scrape_listings_with_shared_session(
             links=links,
             model_name=model_name,
@@ -1374,10 +1774,22 @@ async def initialize_browsers(
 
     async def _run(link: str, index: int) -> dict[str, Any]:
         label = _listing_id(link)
-        run_context_id = (
+        run_context_id = per_link_context_overrides.get(link) or (
             shared_context_id
             if use_shared_context
             else _context_id_from_listing_url(link)
+        )
+        run_browserbase_context_mode = bool(
+            browserbase_shared_context_mode and run_context_id
+        )
+        resolved_run_context_id = (
+            _resolve_browserbase_context_id(run_context_id)
+            if run_browserbase_context_mode
+            else _resolve_stagehand_context_id(run_context_id, listing_url=link)
+        )
+        encoded_run_context_ref = _encode_context_ref(
+            resolved_run_context_id,
+            browserbase_context_mode=run_browserbase_context_mode,
         )
         async with semaphore:
             print(f"[{index}/{len(links)}] starting {label}…", flush=True)
@@ -1387,14 +1799,31 @@ async def initialize_browsers(
                         link=link,
                         model_name=model_name,
                         context_id=run_context_id,
-                        persistent_session=keep_windows_open,
+                        persistent_session=keep_windows_open
+                        and not run_browserbase_context_mode,
+                        use_browserbase_context=run_browserbase_context_mode,
                     ),
                     timeout=scrape_timeout_s,
                 )
             except asyncio.TimeoutError as exc:
-                raise RuntimeError(
-                    f"Scrape timed out after {scrape_timeout_s:.0f}s for {link}"
-                ) from exc
+                _debug_print(
+                    label,
+                    f"scrape timed out after {scrape_timeout_s:.0f}s; using fallback payload.",
+                )
+                return {
+                    "stagehand_context_id": encoded_run_context_ref,
+                    "browserbase_session_id": encoded_run_context_ref,
+                    "listing_url": link,
+                    "data": _minimal_listing_data(link),
+                }
+            except Exception as exc:
+                _debug_print(label, f"scrape failed; using fallback payload: {exc}")
+                return {
+                    "stagehand_context_id": encoded_run_context_ref,
+                    "browserbase_session_id": encoded_run_context_ref,
+                    "listing_url": link,
+                    "data": _minimal_listing_data(link),
+                }
 
     tasks = [_run(link, i) for i, link in enumerate(links, start=1)]
     results = await asyncio.gather(*tasks)
@@ -1415,34 +1844,51 @@ async def send_listing_message(
     skip_if_buyer_message_exists: bool = False,
 ) -> dict[str, str | None]:
     """
-    Start a local Stagehand session with a persisted context, open the listing
+    Start a Stagehand session with a persisted context, open the listing
     message box, send a message, wait for a reply, and return only the sent
     message and any seller reply.
     """
     load_dotenv()
     if not listing_url:
         raise ValueError(
-            "listing_url is required when sending messages via local Stagehand sessions"
+            "listing_url is required when sending messages via Stagehand sessions"
         )
-    resolved_context_id = _resolve_stagehand_context_id(
-        stagehand_context_id,
-        listing_url=listing_url,
+    browserbase_mode_from_ref, decoded_context_id = _decode_context_ref(
+        stagehand_context_id
+    )
+    configured_shared_context_id = (
+        os.environ.get("STAGEHAND_CONTEXT_ID")
+        or os.environ.get("BROWSERBASE_CONTEXT_ID")
+        or ""
+    ).strip()
+    use_browserbase_context = browserbase_mode_from_ref or (
+        _use_browserbase_context_mode()
+        and bool(configured_shared_context_id)
+        and decoded_context_id == configured_shared_context_id
+    )
+    resolved_context_id = (
+        _resolve_browserbase_context_id(decoded_context_id)
+        if use_browserbase_context
+        else _resolve_stagehand_context_id(decoded_context_id, listing_url=listing_url)
     )
 
-    lock = _context_send_lock(resolved_context_id)
-    if lock.locked():
-        _debug_print(
-            resolved_context_id[:12],
-            "another message send is in progress; waiting for context lock…",
-        )
+    lock: asyncio.Lock | None = None
+    if not use_browserbase_context:
+        lock = _context_send_lock(resolved_context_id)
+        if lock.locked():
+            _debug_print(
+                resolved_context_id[:12],
+                "another message send is in progress; waiting for context lock…",
+            )
 
-    async with lock:
+    lock_context = lock if lock is not None else _noop_async_context_manager()
+    async with lock_context:
         active_bundle = _ACTIVE_LISTING_SESSIONS.get(resolved_context_id)
         client: Any
         session: Any
         ephemeral_client = False
 
-        if active_bundle:
+        if active_bundle and not use_browserbase_context:
             client = active_bundle["client"]
             session = active_bundle["session"]
             _debug_print(
@@ -1450,22 +1896,24 @@ async def send_listing_message(
                 "reusing existing listing window/session for message send.",
             )
         else:
-            client = AsyncStagehand(**_stagehand_client_config())
+            client = AsyncStagehand(
+                **_stagehand_client_config(
+                    use_browserbase_context=use_browserbase_context
+                )
+            )
             ephemeral_client = True
             await client.__aenter__()
             try:
-                _prepare_context_for_launch(resolved_context_id)
-                session = await client.sessions.start(
+                session = await _start_stagehand_session(
+                    client=client,
                     model_name=model_name,
-                    browser=_build_local_browser_config(resolved_context_id),
+                    context_id=resolved_context_id,
+                    use_browserbase_context=use_browserbase_context,
                 )
             except APIResponseValidationError as e:
                 print(f"Session schema error — HTTP {e.response.status_code}")
                 print(e.response.text)
                 raise
-
-            if not session.id:
-                raise RuntimeError(f"Expected session ID, got {session!r}")
 
         _debug_print(
             resolved_context_id[:12],
@@ -1538,13 +1986,114 @@ async def send_listing_message(
             )
             return result
         finally:
-            if resolved_context_id in _ACTIVE_LISTING_SESSIONS:
+            if not use_browserbase_context and resolved_context_id in _ACTIVE_LISTING_SESSIONS:
                 _tile_chrome_windows()
             elif _keep_open_on_done():
                 _debug_print(
                     resolved_context_id[:12],
                     "keeping session/browser open for debugging (not ending session).",
                 )
+            else:
+                try:
+                    await session.end()
+                except Exception:
+                    pass
+            if ephemeral_client:
+                try:
+                    await client.__aexit__(None, None, None)
+                except Exception:
+                    pass
+
+
+async def poll_listing_reply(
+    stagehand_context_id: str,
+    *,
+    sent_message: str,
+    listing_url: str | None = None,
+    model_name: str = "anthropic/claude-sonnet-4-6",
+) -> str | None:
+    """
+    Poll for a seller reply that appeared after the given buyer message.
+    Reuses active persistent local sessions when available.
+    """
+    load_dotenv()
+    if not sent_message or not sent_message.strip():
+        return None
+
+    browserbase_mode_from_ref, decoded_context_id = _decode_context_ref(
+        stagehand_context_id
+    )
+    configured_shared_context_id = (
+        os.environ.get("STAGEHAND_CONTEXT_ID")
+        or os.environ.get("BROWSERBASE_CONTEXT_ID")
+        or ""
+    ).strip()
+    use_browserbase_context = browserbase_mode_from_ref or (
+        _use_browserbase_context_mode()
+        and bool(configured_shared_context_id)
+        and decoded_context_id == configured_shared_context_id
+    )
+    resolved_context_id = (
+        _resolve_browserbase_context_id(decoded_context_id)
+        if use_browserbase_context
+        else _resolve_stagehand_context_id(decoded_context_id, listing_url=listing_url)
+    )
+
+    lock: asyncio.Lock | None = None
+    if not use_browserbase_context:
+        lock = _context_send_lock(resolved_context_id)
+    lock_context = lock if lock is not None else _noop_async_context_manager()
+
+    async with lock_context:
+        active_bundle = _ACTIVE_LISTING_SESSIONS.get(resolved_context_id)
+        client: Any
+        session: Any
+        ephemeral_client = False
+
+        if active_bundle and not use_browserbase_context:
+            client = active_bundle["client"]
+            session = active_bundle["session"]
+        else:
+            client = AsyncStagehand(
+                **_stagehand_client_config(
+                    use_browserbase_context=use_browserbase_context
+                )
+            )
+            ephemeral_client = True
+            await client.__aenter__()
+            try:
+                session = await _start_stagehand_session(
+                    client=client,
+                    model_name=model_name,
+                    context_id=resolved_context_id,
+                    use_browserbase_context=use_browserbase_context,
+                )
+            except APIResponseValidationError as e:
+                print(f"Session schema error — HTTP {e.response.status_code}")
+                print(e.response.text)
+                raise
+
+        try:
+            if listing_url and ephemeral_client:
+                await session.navigate(
+                    url=listing_url,
+                    options={"wait_until": "domcontentloaded"},
+                )
+            response = await session.extract(
+                instruction=_build_reply_check_instruction(sent_message),
+                schema=REPLY_CHECK_SCHEMA,
+                options={"model": model_name},
+            )
+            reply_data = _to_dict(response.data.result if response.data else None) or {}
+            if not reply_data.get("seller_replied"):
+                return None
+            raw_reply = reply_data.get("reply_message")
+            if isinstance(raw_reply, str):
+                return raw_reply.strip() or None
+            return None
+        finally:
+            if not use_browserbase_context and resolved_context_id in _ACTIVE_LISTING_SESSIONS:
+                pass
             else:
                 try:
                     await session.end()

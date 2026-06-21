@@ -7,6 +7,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from agent_events import AgentEventPublisher
 from browserb import search_marketplace
 
 logger = logging.getLogger(__name__)
@@ -80,10 +81,24 @@ async def _run_orchestration(
 ) -> None:
     from agent_initializer import run_dealbot
 
+    event_publisher = AgentEventPublisher(job_id=job_id)
     logger.info(
         "Starting orchestration job %s for %d listing(s)",
         job_id,
         len(listing_urls),
+    )
+    event_publisher.publish(
+        "job_started",
+        actor_type="manager",
+        actor_id="manager",
+        summary="Manager started orchestration",
+        details={
+            "product": product,
+            "budget": budget,
+            "max_price": max_price,
+            "listing_count": len(listing_urls),
+            "listing_urls": listing_urls,
+        },
     )
     try:
         await run_dealbot(
@@ -91,10 +106,27 @@ async def _run_orchestration(
             target_budget=budget,
             max_price=max_price,
             listing_urls=listing_urls,
+            event_publisher=event_publisher,
+        )
+        event_publisher.publish(
+            "job_completed",
+            actor_type="manager",
+            actor_id="manager",
+            summary="Manager completed orchestration",
+            details={"listing_count": len(listing_urls)},
         )
         logger.info("Orchestration job %s completed", job_id)
-    except Exception:
+    except Exception as exc:
+        event_publisher.publish(
+            "job_failed",
+            actor_type="manager",
+            actor_id="manager",
+            summary="Manager failed orchestration",
+            details={"error": str(exc)},
+        )
         logger.exception("Orchestration job %s failed", job_id)
+    finally:
+        event_publisher.close()
 
 
 @app.get("/health")

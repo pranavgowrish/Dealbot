@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import SystemMessage
 
+from agent_events import AgentEventPublisher
 from browserb import initialize_browsers, send_listing_message
 from memory import AgentMemoryStore, parse_price
 
@@ -67,6 +68,26 @@ def _job_context(
     }
 
 
+def _emit_event(
+    event_publisher: AgentEventPublisher | None,
+    *,
+    event_type: str,
+    actor_type: str,
+    actor_id: str,
+    summary: str,
+    details: dict[str, Any] | None = None,
+) -> None:
+    if event_publisher is None:
+        return
+    event_publisher.publish(
+        event_type,
+        actor_type=actor_type,
+        actor_id=actor_id,
+        summary=summary,
+        details=details or {},
+    )
+
+
 def _build_worker_long_term(
     worker_name: str,
     agent_id: str,
@@ -111,12 +132,15 @@ async def _generate_first_message(
     product: dict[str, Any],
     *,
     product_name: str,
+    opening_offer: float | None = None,
 ) -> str:
     title = product.get("title") or product_name
     price = product.get("price") or "unknown"
     description = (product.get("description") or "").strip()
     seller_first_name = _first_name(product.get("seller_name"))
     location = product.get("location") or ""
+    date_listed = product.get("date_listed") or "unknown"
+    reason_for_selling = product.get("reason_for_selling") or "unknown"
 
     prompt = SystemMessage(
         content=f"""Write the first Facebook Marketplace message to a seller.
@@ -127,15 +151,20 @@ Listing details:
 - Location: {location or "not listed"}
 - Seller first name: {seller_first_name or "unknown"}
 - Description: {description or "not provided"}
+- Date listed text: {date_listed}
+- Stated reason for selling: {reason_for_selling}
+- Suggested first offer anchor: {f"${opening_offer:.0f}" if opening_offer is not None else "none"}
 
 Rules:
 - Be kind, warm, and genuinely interested — sound like a real person, not a bot
-- Personalize using specific details from the listing (item name, location, description)
+- Before writing, internally assess seller flexibility, motivation to sell quickly, listing staleness, and reason for selling
+- Then choose ONE tactic from: anchoring low, bundling, flinch, walk-away, deadline with cash pickup
+- Personalize using specific details from the listing (item name, location, description, staleness/reason cues)
 - If a seller name is available, use ONLY the first name (never full name)
 - Make this opener distinct and specific to this listing; avoid generic phrasing
 - Keep it to 1-2 short sentences
-- Ask if the item is still available (or a natural variation)
-- Do NOT mention negotiating, lower prices, or other sellers
+- For deadline tactics, mention immediate pickup and cash
+- Keep it realistic for a first message (do not be rude or overly aggressive)
 - Do NOT use emojis
 - Output ONLY the message text to send. No quotes, labels, or explanation."""
     )
@@ -156,6 +185,7 @@ async def initialize_agents(
     listing_urls: list[str],
     send_openers: bool = True,
     reply_wait_ms: int = 2500,
+    event_publisher: AgentEventPublisher | None = None,
 ) -> dict[str, Any]:
     if not listing_urls:
         raise ValueError("At least one listing URL is required")
@@ -183,6 +213,18 @@ async def initialize_agents(
             "Cannot connect to Redis. Start local Redis with: docker compose up -d redis"
         ) from exc
     _log("Redis connected.")
+    _emit_event(
+        event_publisher,
+        event_type="manager_bootstrap",
+        actor_type="manager",
+        actor_id="manager",
+        summary=f"Manager initialized {len(worker_names)} workers",
+        details={
+            "worker_ids": worker_names,
+            "target_budget": target_budget,
+            "max_price": max_price,
+        },
+    )
 
     use_shared_context = _env_bool("STAGEHAND_USE_SHARED_CONTEXT", True)
     keep_windows_open = _env_bool("STAGEHAND_KEEP_WINDOWS_OPEN", True)
@@ -195,7 +237,7 @@ async def initialize_agents(
         max_concurrency=min(5, len(listing_urls)),
         scrape_timeout_s=120,
         use_shared_context=use_shared_context,
-        keep_windows_open=keep_windows_open and not use_shared_context,
+        keep_windows_open=keep_windows_open,
     )
     if len(scraped) != len(worker_names):
         raise RuntimeError(
@@ -244,13 +286,56 @@ async def initialize_agents(
                 "current_min_price": opening_offer,
             },
         )
+        await asyncio.to_thread(
+            memory.upsert_listing_vector,
+            worker_id=worker_name,
+            listing_url=listing.get("listing_url", ""),
+            title=product.get("title") or product_name,
+            description=product.get("description") or "",
+            condition_text=(
+                product.get("condition")
+                or product.get("reason_for_selling")
+                or product.get("date_listed")
+                or ""
+            ),
+            listed_price=listed_price,
+            current_best_price=opening_offer,
+        )
 
         first_message = await _generate_first_message(
             product,
             product_name=product_name,
+            opening_offer=opening_offer,
         )
         opening_messages[worker_name] = first_message
         _log(f"[{worker_name}] opener draft: {first_message}")
+        _emit_event(
+            event_publisher,
+            event_type="worker_initialized",
+            actor_type="worker",
+            actor_id=worker_name,
+            summary=f"{worker_name} initialized with listing context",
+            details={
+                "listing_url": listing.get("listing_url"),
+                "listing_title": product.get("title") or product_name,
+                "listed_price": product.get("price"),
+                "opening_offer": opening_offer,
+            },
+        )
+        _emit_event(
+            event_publisher,
+            event_type="worker_thinking",
+            actor_type="worker",
+            actor_id=worker_name,
+            summary=f"{worker_name} drafted opening message",
+            details={
+                "phase": "opening_message",
+                "thought": (
+                    "Analyzed seller profile and listing cues to draft a personalized opener."
+                ),
+                "draft_message": first_message,
+            },
+        )
         opener_reply: str | None = None
 
         if send_openers:
@@ -290,15 +375,24 @@ async def initialize_agents(
 
     if send_openers and pending_openers:
         shared_context = len({item["session_id"] for item in pending_openers}) == 1
-        if shared_context:
+        shared_browserbase_context = shared_context and str(
+            pending_openers[0]["session_id"]
+        ).startswith("browserbase-context:")
+        if shared_context and not shared_browserbase_context:
             _log(
                 f"Sending {len(pending_openers)} opener(s) sequentially "
                 "to avoid context collisions…"
             )
             opener_parallelism = 1
         else:
-            _log(f"Sending {len(pending_openers)} opener(s) concurrently…")
-            opener_parallelism = min(4, len(pending_openers))
+            if shared_browserbase_context:
+                _log(
+                    f"Sending {len(pending_openers)} opener(s) concurrently "
+                    "(shared Browserbase context mounted read-only)…"
+                )
+            else:
+                _log(f"Sending {len(pending_openers)} opener(s) concurrently…")
+            opener_parallelism = min(5, len(pending_openers))
 
         semaphore = asyncio.Semaphore(opener_parallelism)
 
@@ -306,6 +400,29 @@ async def initialize_agents(
             worker_name = opener["worker_name"]
             async with semaphore:
                 _log(f"[{worker_name}] sending opener…")
+                _emit_event(
+                    event_publisher,
+                    event_type="manager_directive",
+                    actor_type="manager",
+                    actor_id="manager",
+                    summary=f"Manager directed {worker_name} to send opener",
+                    details={
+                        "worker_id": worker_name,
+                        "directive": "Send personalized opener and wait for seller reply",
+                    },
+                )
+                _emit_event(
+                    event_publisher,
+                    event_type="message_sent",
+                    actor_type="worker",
+                    actor_id=worker_name,
+                    summary=f"{worker_name} sent opening message",
+                    details={
+                        "to": "seller",
+                        "message": opener["first_message"],
+                        "phase": "opener",
+                    },
+                )
                 chat = await send_listing_message(
                     opener["session_id"],
                     opener["first_message"],
@@ -334,6 +451,19 @@ async def initialize_agents(
                         else ", no reply yet"
                     )
                 )
+                if opener_reply:
+                    _emit_event(
+                        event_publisher,
+                        event_type="message_received",
+                        actor_type="worker",
+                        actor_id=worker_name,
+                        summary=f"{worker_name} received seller opener reply",
+                        details={
+                            "from": "seller",
+                            "message": opener_reply,
+                            "phase": "opener",
+                        },
+                    )
                 return worker_name, opener_reply
 
         opener_results = await asyncio.gather(
@@ -377,6 +507,7 @@ async def run_dealbot(
     target_budget: float,
     max_price: float,
     listing_urls: list[str],
+    event_publisher: AgentEventPublisher | None = None,
 ) -> dict[str, Any]:
     from orchestration import launch_negotiation
 
@@ -386,9 +517,13 @@ async def run_dealbot(
         max_price=max_price,
         listing_urls=listing_urls,
         send_openers=True,
+        event_publisher=event_publisher,
     )
     _log("Starting negotiation loops…")
-    negotiation_results = await launch_negotiation(init_result["assignments"])
+    negotiation_results = await launch_negotiation(
+        init_result["assignments"],
+        event_publisher=event_publisher,
+    )
     return {
         "initialization": init_result,
         "negotiation": negotiation_results,

@@ -15,3 +15,6 @@ stagehand
 dotenv
 python-dotenv
 redis
+redisvl
+sentence-transformers
+paho-mqtt

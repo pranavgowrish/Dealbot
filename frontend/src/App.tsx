@@ -8,7 +8,7 @@ import { AnimatePresence, motion } from 'framer-motion';
 import { JourneyStepper } from './components/JourneyStepper';
 import { ListingAmbientBackground } from './components/ListingAmbientBackground';
 import { LoadingProgress } from './components/LoadingProgress';
-import { useAgentStream } from './hooks/useAgentStream';
+import { AgentNegotiationGraph } from './components/AgentNegotiationGraph';
 
 const LOGO_SRC = '/LOGO_SRC.png';
 const API_BASE = 'http://localhost:8000';
@@ -68,6 +68,7 @@ export default function App() {
   const [searchError, setSearchError] = useState<string | null>(null);
   const [orchestrateError, setOrchestrateError] = useState<string | null>(null);
   const [isConfirming, setIsConfirming] = useState(false);
+  const [activeJobId, setActiveJobId] = useState<string | null>(null);
   /** UI-only — controls optional filters accordion; not sent anywhere special. */
   const [showOptionalFilters, setShowOptionalFilters] = useState(false);
   /** UI-only — loader animation driven by elapsed time during search. */
@@ -76,8 +77,6 @@ export default function App() {
   const [loaderListingCount, setLoaderListingCount] = useState(0);
 
   const loaderIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  const { reset } = useAgentStream({ simulate: true });
 
   const isFormVisible = loadingState === 'idle';
   const isFastapiLoading = loadingState === 'fastapi_loading';
@@ -197,6 +196,7 @@ export default function App() {
 
     setIsConfirming(true);
     setOrchestrateError(null);
+    setActiveJobId(null);
 
     try {
       const response = await fetch(`${API_BASE}/api/v1/orchestrate`, {
@@ -219,6 +219,8 @@ export default function App() {
         throw new Error(detail);
       }
 
+      const data = (await response.json()) as { job_id: string; status: string };
+      setActiveJobId(data.job_id);
       setLoadingState('success_confirmed');
     } catch (error) {
       console.error('Orchestration failed', error);
@@ -233,13 +235,13 @@ export default function App() {
   };
 
   const handleReset = () => {
-    reset();
     setLoadingState('idle');
     setListings([]);
     setSelectedListings([]);
     setSearchError(null);
     setOrchestrateError(null);
     setIsConfirming(false);
+    setActiveJobId(null);
     setProduct('');
     setPrice('');
     setLocation('');
@@ -657,62 +659,10 @@ export default function App() {
               transition={{ type: 'spring', stiffness: 220, damping: 26 }}
               className="reset-wrap"
             >
-              <div className="success-card">
-                <div className="success-icon">
-                  <svg
-                    width="20"
-                    height="20"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="var(--green-accent-light)"
-                    strokeWidth="2.5"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    aria-hidden
-                  >
-                    <path d="M5 13l4 4L19 7" />
-                  </svg>
-                </div>
-                <div>
-                  <p className="success-title">Hunt is underway</p>
-                  <p className="success-body">
-                    Your agents are reaching out, negotiating, and following up.
-                    Check your inbox for updates.
-                  </p>
-                </div>
-
-                <ol className="success-timeline">
-                  <li className="success-timeline-item success-timeline-item--complete">
-                    <span className="success-timeline-dot" aria-hidden />
-                    Listings approved
-                  </li>
-                  <li className="success-timeline-item success-timeline-item--active">
-                    <span className="success-timeline-dot" aria-hidden />
-                    Agents reaching out
-                  </li>
-                  <li className="success-timeline-item">
-                    <span className="success-timeline-dot" aria-hidden />
-                    Negotiations
-                  </li>
-                  <li className="success-timeline-item">
-                    <span className="success-timeline-dot" aria-hidden />
-                    Best deal sent to inbox
-                  </li>
-                </ol>
-
-                <div className="success-agents-row">
-                  {Array.from({ length: selectedListings.length }, (_, i) => (
-                    <span key={i} className="success-agent-dot" aria-hidden />
-                  ))}
-                  <span className="success-agents-label">
-                    {selectedListings.length} agent{selectedListings.length > 1 ? 's' : ''} active
-                  </span>
-                </div>
-
-                <button type="button" onClick={handleReset} className="btn-reset">
-                  Start a new hunt
-                </button>
-              </div>
+              <AgentNegotiationGraph jobId={activeJobId} />
+              <button type="button" onClick={handleReset} className="btn-reset">
+                Start a new hunt
+              </button>
             </motion.div>
           )}
         </AnimatePresence>
