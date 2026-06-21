@@ -6,3 +6,9 @@ arize-otel
 openinference-instrumentation-langchain
 langgraph 
 langchain-anthropic
+
+browserbase
+stagehand
+dotenv
+python-dotenv
+redis
