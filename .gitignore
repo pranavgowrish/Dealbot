@@ -5,6 +5,7 @@ backend/venv/
 frontend/node_modules/
 backend/__pycache__/
 backend/.env
+backend/.stagehand_contexts/
 backend/example.py
 .venv
 .DS_Store

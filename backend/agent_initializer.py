@@ -33,6 +33,16 @@ def _log(message: str) -> None:
     print(message, flush=True)
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.split("#", 1)[0].strip().lower()
+    if not value:
+        return default
+    return value in {"1", "true", "yes", "on"}
+
+
 def _first_name(full_name: str | None) -> str:
     if not full_name:
         return ""
@@ -68,7 +78,11 @@ def _build_worker_long_term(
         "role": worker_name,
         "agent_id": agent_id,
         "listing_url": listing.get("listing_url"),
-        "browserbase_session_id": listing.get("browserbase_session_id"),
+        "stagehand_context_id": listing.get("stagehand_context_id")
+        or listing.get("browserbase_session_id"),
+        # Legacy key kept for backward compatibility in memory records.
+        "browserbase_session_id": listing.get("stagehand_context_id")
+        or listing.get("browserbase_session_id"),
         "product": listing.get("data") or {},
         "job": job_context,
     }
@@ -170,11 +184,18 @@ async def initialize_agents(
         ) from exc
     _log("Redis connected.")
 
-    _log(f"Scraping {len(worker_names)} listing(s) via Browserbase…")
+    use_shared_context = _env_bool("STAGEHAND_USE_SHARED_CONTEXT", True)
+    keep_windows_open = _env_bool("STAGEHAND_KEEP_WINDOWS_OPEN", True)
+    _log(
+        f"Scraping {len(worker_names)} listing(s) via local Stagehand "
+        f"(shared_context={use_shared_context})…"
+    )
     scraped = await initialize_browsers(
         listing_urls,
-        max_concurrency=2,
+        max_concurrency=min(5, len(listing_urls)),
         scrape_timeout_s=120,
+        use_shared_context=use_shared_context,
+        keep_windows_open=keep_windows_open and not use_shared_context,
     )
     if len(scraped) != len(worker_names):
         raise RuntimeError(
@@ -190,9 +211,11 @@ async def initialize_agents(
 
     for worker_name, listing in zip(worker_names, scraped, strict=True):
         agent_id = worker_agent_ids[worker_name]
-        session_id = listing.get("browserbase_session_id")
+        session_id = listing.get("stagehand_context_id") or listing.get(
+            "browserbase_session_id"
+        )
         if not session_id:
-            raise RuntimeError(f"Missing browserbase_session_id for {worker_name}")
+            raise RuntimeError(f"Missing stagehand_context_id for {worker_name}")
 
         worker_session_ids[worker_name] = session_id
         product = listing.get("data") or {}
@@ -236,6 +259,7 @@ async def initialize_agents(
                     "worker_name": worker_name,
                     "agent_id": agent_id,
                     "session_id": session_id,
+                    "listing_url": listing.get("listing_url"),
                     "first_message": first_message,
                     "opening_offer": opening_offer,
                 }
@@ -245,6 +269,8 @@ async def initialize_agents(
             {
                 "worker_name": worker_name,
                 "agent_id": agent_id,
+                "stagehand_context_id": session_id,
+                # Legacy key kept for compatibility with older consumers.
                 "browserbase_session_id": session_id,
                 "listing_url": listing.get("listing_url"),
                 "product": product,
@@ -263,8 +289,18 @@ async def initialize_agents(
             )
 
     if send_openers and pending_openers:
-        _log(f"Sending {len(pending_openers)} opener(s) concurrently…")
-        semaphore = asyncio.Semaphore(min(3, len(pending_openers)))
+        shared_context = len({item["session_id"] for item in pending_openers}) == 1
+        if shared_context:
+            _log(
+                f"Sending {len(pending_openers)} opener(s) sequentially "
+                "to avoid context collisions…"
+            )
+            opener_parallelism = 1
+        else:
+            _log(f"Sending {len(pending_openers)} opener(s) concurrently…")
+            opener_parallelism = min(4, len(pending_openers))
+
+        semaphore = asyncio.Semaphore(opener_parallelism)
 
         async def _send_single_opener(opener: dict[str, Any]) -> tuple[str, str | None]:
             worker_name = opener["worker_name"]
@@ -273,13 +309,19 @@ async def initialize_agents(
                 chat = await send_listing_message(
                     opener["session_id"],
                     opener["first_message"],
+                    listing_url=opener["listing_url"],
                     reply_wait_ms=reply_wait_ms,
+                    skip_if_buyer_message_exists=True,
                 )
                 opener_reply = chat.get("reply_message")
+                sent_message = chat.get("sent_message")
+                if not sent_message:
+                    _log(f"[{worker_name}] opener already present, skipping send.")
+                    return worker_name, opener_reply
                 await asyncio.to_thread(
                     memory.record_exchange,
                     opener["agent_id"],
-                    sent_message=opener["first_message"],
+                    sent_message=sent_message,
                     reply_message=opener_reply,
                     current_min_price=opener["opening_offer"],
                     status="negotiating",
@@ -306,7 +348,7 @@ async def initialize_agents(
     print("\nAgent assignments initialized:")
     for item in assignments:
         print(f"\n  {item['worker_name']} -> {item['agent_id']}")
-        print(f"    session id     : {item['browserbase_session_id']}")
+        print(f"    context id     : {item['stagehand_context_id']}")
         print(f"    listing        : {item['listing_url']}")
         print(f"    product        : {item['product'].get('title')} — {item['product'].get('price')}")
         print(f"    first message  : {item['first_message']}")

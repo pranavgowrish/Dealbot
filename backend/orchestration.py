@@ -33,7 +33,7 @@ REPLY_WAIT_MS = int(os.environ.get("REPLY_WAIT_MS", "4000"))
 
 class WorkerState(TypedDict):
     worker_id: str
-    browserbase_session_id: str
+    stagehand_context_id: str
     seller_name: str
     listing_title: str
     listing_url: str
@@ -104,8 +104,9 @@ Rules:
     message_content = str(ai_response.content).strip()
 
     chat = await send_listing_message(
-        state["browserbase_session_id"],
+        state["stagehand_context_id"],
         message_content,
+        listing_url=state["listing_url"],
         reply_wait_ms=REPLY_WAIT_MS,
     )
     reply = chat.get("reply_message")
@@ -214,8 +215,9 @@ async def update_memory(state: WorkerState) -> dict[str, Any]:
 async def wrap_up(state: WorkerState) -> dict[str, Any]:
     final_message = "Thanks for your time!"
     await send_listing_message(
-        state["browserbase_session_id"],
+        state["stagehand_context_id"],
         final_message,
+        listing_url=state["listing_url"],
         reply_wait_ms=1000,
     )
     await asyncio.to_thread(
@@ -262,9 +264,15 @@ def build_worker_input(assignment: dict[str, Any]) -> WorkerState:
     product = long_term.get("product") or assignment.get("product") or {}
     job = long_term.get("job") or {}
 
+    context_id = assignment.get("stagehand_context_id") or assignment.get(
+        "browserbase_session_id"
+    )
+    if not context_id:
+        raise ValueError(f"Missing stagehand context id for worker {worker_id}")
+
     return {
         "worker_id": worker_id,
-        "browserbase_session_id": assignment["browserbase_session_id"],
+        "stagehand_context_id": context_id,
         "seller_name": product.get("seller_name") or "seller",
         "listing_title": product.get("title") or "item",
         "listing_url": assignment.get("listing_url") or long_term.get("listing_url", ""),
