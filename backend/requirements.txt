@@ -4,8 +4,10 @@ pydantic
 
 arize-otel 
 openinference-instrumentation-langchain
-langgraph 
-langchain-anthropic
+langchain>=1.3.10
+langchain-core>=1.4.7
+langgraph>=1.2.5
+langchain-anthropic>=1.4.6
 
 browserbase
 playwright

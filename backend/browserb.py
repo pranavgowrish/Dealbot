@@ -406,6 +406,15 @@ def _debug_print(label: str, message: str) -> None:
     print(f"[{label}] {message}")
 
 
+def _message_preview(text: str | None, limit: int = 220) -> str:
+    if not text:
+        return ""
+    cleaned = " ".join(str(text).split())
+    if len(cleaned) <= limit:
+        return cleaned
+    return f"{cleaned[:limit]}..."
+
+
 def _build_send_message_instruction(message: str) -> str:
     quoted = json.dumps(message)
     return f"""You are on a Facebook Marketplace listing page.
@@ -698,6 +707,10 @@ async def send_listing_message(
             raise RuntimeError(f"Expected session ID, got {session!r}")
 
         _debug_print(browserbase_session_id[:8], "resumed session, opening chat…")
+        _debug_print(
+            browserbase_session_id[:8],
+            f"OUTBOUND message: {_message_preview(message)}",
+        )
 
         await session.execute(
             agent_config={"model": model_name},
@@ -732,7 +745,11 @@ async def send_listing_message(
         }
         _debug_print(
             browserbase_session_id[:8],
-            f"reply={'yes' if reply else 'no'}",
+            (
+                f"INBOUND reply: {_message_preview(reply)}"
+                if reply
+                else "INBOUND reply: <none>"
+            ),
         )
         return result
 

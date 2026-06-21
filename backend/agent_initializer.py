@@ -33,6 +33,15 @@ def _log(message: str) -> None:
     print(message, flush=True)
 
 
+def _first_name(full_name: str | None) -> str:
+    if not full_name:
+        return ""
+    cleaned = " ".join(str(full_name).replace(",", " ").split()).strip()
+    if not cleaned:
+        return ""
+    return cleaned.split(" ", 1)[0]
+
+
 def _job_context(
     *,
     product_name: str,
@@ -72,19 +81,16 @@ def _build_first_message_fallback(
 ) -> str:
     title = product.get("title") or product_name
     price = product.get("price") or "your listed price"
-    seller_name = product.get("seller_name")
+    seller_first_name = _first_name(product.get("seller_name"))
     location = product.get("location")
-    greeting = f"Hi {seller_name}!" if seller_name else "Hi!"
-
-    if location:
-        return (
-            f"{greeting} I saw your {title} for {price} in {location} and it looks great. "
-            f"Is it still available?"
-        )
-    return (
-        f"{greeting} I saw your {title} for {price} and it looks great. "
-        f"Is it still available?"
-    )
+    greeting = f"Hi {seller_first_name}!" if seller_first_name else "Hi there!"
+    location_clause = f" in {location}" if location else ""
+    templates = [
+        f"{greeting} I just came across your {title} listed at {price}{location_clause}. Is it still available?",
+        f"{greeting} Your {title} for {price}{location_clause} caught my eye. Is it still available?",
+        f"{greeting} I’m interested in your {title} priced at {price}{location_clause}. Is it still available?",
+    ]
+    return templates[len(str(title)) % len(templates)]
 
 
 async def _generate_first_message(
@@ -95,7 +101,7 @@ async def _generate_first_message(
     title = product.get("title") or product_name
     price = product.get("price") or "unknown"
     description = (product.get("description") or "").strip()
-    seller_name = product.get("seller_name") or ""
+    seller_first_name = _first_name(product.get("seller_name"))
     location = product.get("location") or ""
 
     prompt = SystemMessage(
@@ -105,13 +111,14 @@ Listing details:
 - Item: {title}
 - Price: {price}
 - Location: {location or "not listed"}
-- Seller name: {seller_name or "unknown"}
+- Seller first name: {seller_first_name or "unknown"}
 - Description: {description or "not provided"}
 
 Rules:
 - Be kind, warm, and genuinely interested — sound like a real person, not a bot
 - Personalize using specific details from the listing (item name, location, description)
-- Use the seller's first name naturally if you have it
+- If a seller name is available, use ONLY the first name (never full name)
+- Make this opener distinct and specific to this listing; avoid generic phrasing
 - Keep it to 1-2 short sentences
 - Ask if the item is still available (or a natural variation)
 - Do NOT mention negotiating, lower prices, or other sellers
@@ -176,6 +183,7 @@ async def initialize_agents(
 
     assignments: list[dict[str, Any]] = []
     opening_messages: dict[str, str] = {}
+    pending_openers: list[dict[str, Any]] = []
 
     _log("Writing agent memory to Redis…")
     await asyncio.to_thread(memory.init_market_floor)
@@ -223,24 +231,14 @@ async def initialize_agents(
         opener_reply: str | None = None
 
         if send_openers:
-            _log(f"[{worker_name}] sending opener…")
-            chat = await send_listing_message(
-                session_id,
-                first_message,
-                reply_wait_ms=reply_wait_ms,
-            )
-            opener_reply = chat.get("reply_message")
-            await asyncio.to_thread(
-                memory.record_exchange,
-                agent_id,
-                sent_message=first_message,
-                reply_message=opener_reply,
-                current_min_price=opening_offer,
-                status="negotiating",
-            )
-            _log(
-                f"[{worker_name}] opener sent"
-                + (f", seller replied: {opener_reply!r}" if opener_reply else ", no reply yet")
+            pending_openers.append(
+                {
+                    "worker_name": worker_name,
+                    "agent_id": agent_id,
+                    "session_id": session_id,
+                    "first_message": first_message,
+                    "opening_offer": opening_offer,
+                }
             )
 
         assignments.append(
@@ -263,6 +261,47 @@ async def initialize_agents(
                 worker_id=worker_name,
                 listing_url=listing.get("listing_url", ""),
             )
+
+    if send_openers and pending_openers:
+        _log(f"Sending {len(pending_openers)} opener(s) concurrently…")
+        semaphore = asyncio.Semaphore(min(3, len(pending_openers)))
+
+        async def _send_single_opener(opener: dict[str, Any]) -> tuple[str, str | None]:
+            worker_name = opener["worker_name"]
+            async with semaphore:
+                _log(f"[{worker_name}] sending opener…")
+                chat = await send_listing_message(
+                    opener["session_id"],
+                    opener["first_message"],
+                    reply_wait_ms=reply_wait_ms,
+                )
+                opener_reply = chat.get("reply_message")
+                await asyncio.to_thread(
+                    memory.record_exchange,
+                    opener["agent_id"],
+                    sent_message=opener["first_message"],
+                    reply_message=opener_reply,
+                    current_min_price=opener["opening_offer"],
+                    status="negotiating",
+                )
+                _log(
+                    f"[{worker_name}] opener sent"
+                    + (
+                        f", seller replied: {opener_reply!r}"
+                        if opener_reply
+                        else ", no reply yet"
+                    )
+                )
+                return worker_name, opener_reply
+
+        opener_results = await asyncio.gather(
+            *(_send_single_opener(item) for item in pending_openers)
+        )
+        replies_by_worker = {worker: reply for worker, reply in opener_results}
+        for item in assignments:
+            worker = item["worker_name"]
+            if worker in replies_by_worker:
+                item["opener_reply"] = replies_by_worker[worker]
 
     print("\nAgent assignments initialized:")
     for item in assignments:
