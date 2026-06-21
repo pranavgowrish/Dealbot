@@ -25,14 +25,21 @@ from stagehand import AsyncStagehand, APIResponseValidationError
 # Helpers
 # ---------------------------------------------------------------------------
 
-async def _stream_to_result(stream, label: str) -> Any | None:
+async def _stream_to_result(
+    stream,
+    label: str,
+    *,
+    verbose: bool = True,
+) -> Any | None:
     result_payload: Any | None = None
     async for event in stream:
         if event.type == "log":
-            print(f"[{label}][log] {event.data.message}")
+            if verbose:
+                print(f"[{label}][log] {event.data.message}")
             continue
         status = event.data.status
-        print(f"[{label}][system] status={status}")
+        if verbose:
+            print(f"[{label}][system] status={status}")
         if status == "finished":
             result_payload = event.data.result
         elif status == "error":
@@ -141,6 +148,40 @@ def _parse_listings(raw: Any, price_min: float, price_max: float) -> list[dict]:
     ]
 
 
+LISTING_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string"},
+        "price": {"type": "string"},
+        "description": {"type": "string"},
+        "seller_name": {"type": "string"},
+        "location": {"type": "string"},
+    },
+    "required": ["title", "price", "description", "seller_name", "location"],
+}
+
+
+def _to_dict(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return value
+    if hasattr(value, "model_dump"):
+        dumped = value.model_dump()
+        return dumped if isinstance(dumped, dict) else None
+    return None
+
+
+def _listing_id(link: str) -> str:
+    if "/item/" in link:
+        return link.split("/item/", 1)[1].split("/", 1)[0]
+    return link[:48]
+
+
+def _debug_print(label: str, message: str) -> None:
+    print(f"[{label}] {message}")
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -235,13 +276,122 @@ async def search_marketplace(
     return listings
 
 
+async def _scrape_listing(
+    link: str,
+    model_name: str,
+) -> dict[str, Any]:
+    """
+    Creates one Browserbase session, opens the page,
+    extracts listing details, and returns the result.
+    """
+    resolved_context_id = os.environ.get("BROWSERBASE_CONTEXT_ID")
+
+    bb = Browserbase(api_key=os.environ["BROWSERBASE_API_KEY"])
+    session_opts: dict[str, Any] = {"project_id": os.environ["BROWSERBASE_PROJECT_ID"]}
+    if resolved_context_id:
+        session_opts["browser_settings"] = {
+            "context": {"id": resolved_context_id, "persist": True}
+        }
+
+    bb_session = bb.sessions.create(**session_opts)
+
+    async with AsyncStagehand(
+        browserbase_api_key=os.environ["BROWSERBASE_API_KEY"],
+        browserbase_project_id=os.environ["BROWSERBASE_PROJECT_ID"],
+        model_api_key=os.environ["MODEL_API_KEY"],
+        _strict_response_validation=True,
+    ) as client:
+
+        try:
+            session = await client.sessions.start(
+                model_name=model_name,
+                browserbase_session_id=bb_session.id,
+            )
+        except APIResponseValidationError as e:
+            print(f"Session schema error — HTTP {e.response.status_code}")
+            print(e.response.text)
+            raise
+
+        try:
+            await session.navigate(
+                url=link,
+                options={"wait_until": "domcontentloaded"},
+            )
+
+            label = _listing_id(link)
+            _debug_print(label, "navigated, extracting listing data…")
+
+            response = await session.extract(
+                instruction=(
+                    "Extract the Facebook Marketplace listing details "
+                    "visible on this page."
+                ),
+                schema=LISTING_SCHEMA,
+                options={"model": model_name},
+            )
+
+            data = _to_dict(response.data.result if response.data else None)
+            if data:
+                _debug_print(
+                    label,
+                    f"{data.get('title', '?')} — {data.get('price', '?')} "
+                    f"({data.get('location', '?')})",
+                )
+            else:
+                _debug_print(
+                    label,
+                    f"extract returned no data (success={response.success})",
+                )
+
+            return {
+                "browserbase_session_id": bb_session.id,
+                "listing_url": link,
+                "data": data,
+            }
+
+        finally:
+            try:
+                await session.end()
+            except Exception:
+                pass
+
+
+async def initialize_browsers(
+    links: list[str],
+    *,
+    model_name: str = "anthropic/claude-sonnet-4-6",
+) -> list[dict[str, Any]]:
+    """
+    Launches one Browserbase + Stagehand session per URL
+    and scrapes all pages concurrently.
+    """
+
+    load_dotenv()
+
+    print(f"Scraping {len(links)} listing(s)…")
+
+    tasks = [
+        _scrape_listing(link=link, model_name=model_name)
+        for link in links
+    ]
+
+    results = await asyncio.gather(*tasks)
+
+    print("\nFinal JSON:")
+    print(json.dumps(results, indent=2))
+
+    return results
+
+
+
 # ---------------------------------------------------------------------------
 # Demo
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    results = asyncio.run(
-        search_marketplace("tote bag", 10.0, "San Diego, CA", max_results=5)
+    asyncio.run(
+        initialize_browsers([
+            "https://www.facebook.com/marketplace/item/954225447099368/?ref=search&referral_code=null&referral_story_type=post&tracking=browse_serp%3Ae9ebf225-f0d9-414c-b089-9d392df74096",
+            "https://www.facebook.com/marketplace/item/1346267354014284/?ref=search&referral_code=null&referral_story_type=post&tracking=browse_serp%3Ae9ebf225-f0d9-414c-b089-9d392df74096",
+        ])
     )
-    print("\nFinal JSON output:")
-    print(json.dumps(results, indent=2))
