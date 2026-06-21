@@ -1,3 +1,6 @@
 .env
 .venv
 .DS_Store
+.venv
+agent_config.yaml
+.env
