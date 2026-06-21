@@ -1,7 +1,13 @@
 from __future__ import annotations
 
 import logging
+import os
 import uuid
+
+# Initialize Arize Phoenix tracing FIRST, before any LangChain model is imported
+# or instantiated, so every negotiation model call is captured. Best-effort: this
+# never raises if Phoenix isn't running.
+import instrumentation  # noqa: F401  (side-effect import: sets up tracing)
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,6 +17,41 @@ from agent_events import AgentEventPublisher
 from browserb import search_marketplace
 
 logger = logging.getLogger(__name__)
+
+
+def _anthropic_credit_error() -> str | None:
+    """Cheap pre-flight: returns a user-facing message if the Anthropic key is
+    unusable (no credit / bad key), else None. Prevents the orchestration from
+    spinning up browsers only to die in the background with a confusing silent
+    failure."""
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv()
+        import anthropic
+
+        key = os.environ.get("MODEL_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
+        if not key:
+            return "No Anthropic API key configured (set MODEL_API_KEY in backend/.env)."
+        client = anthropic.Anthropic(api_key=key)
+        client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1,
+            messages=[{"role": "user", "content": "ok"}],
+        )
+        return None
+    except Exception as exc:  # noqa: BLE001 - surface a friendly message
+        text = str(exc).lower()
+        if "credit balance is too low" in text:
+            return (
+                "Anthropic API credit balance is too low. Add credits at "
+                "console.anthropic.com → Plans & Billing, then try again."
+            )
+        if "authentication" in text or "invalid x-api-key" in text or "401" in text:
+            return "Anthropic API key is invalid. Check MODEL_API_KEY in backend/.env."
+        # Don't block on transient/unknown errors — let the job proceed.
+        logger.warning("Anthropic pre-flight check inconclusive: %s", exc)
+        return None
 
 app = FastAPI(title="Dealbot API")
 
@@ -178,6 +219,10 @@ async def orchestrate(
     payload: OrchestrateRequest,
     background_tasks: BackgroundTasks,
 ) -> OrchestrateResponse:
+    credit_error = _anthropic_credit_error()
+    if credit_error:
+        raise HTTPException(status_code=402, detail=credit_error)
+
     job_id = str(uuid.uuid4())
     background_tasks.add_task(
         _run_orchestration,

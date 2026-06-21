@@ -46,10 +46,22 @@ class AgentEventPublisher:
         )
     )
     host: str = field(
-        default_factory=lambda: os.environ.get("DEALBOT_MQTT_HOST", "localhost").strip()
-        or "localhost"
+        default_factory=lambda: os.environ.get("DEALBOT_MQTT_HOST", "broker.emqx.io").strip()
+        or "broker.emqx.io"
     )
-    port: int = field(default_factory=lambda: int(os.environ.get("DEALBOT_MQTT_PORT", "1883")))
+    # Default to the EMQX WebSocket port (8083). Raw MQTT/TCP (1883) is avoided
+    # because many networks block it; WebSocket rides over HTTP and works on WiFi.
+    port: int = field(default_factory=lambda: int(os.environ.get("DEALBOT_MQTT_PORT", "8083")))
+    transport: str = field(
+        default_factory=lambda: (
+            os.environ.get("DEALBOT_MQTT_TRANSPORT", "websockets").strip().lower()
+            or "websockets"
+        )
+    )
+    ws_path: str = field(
+        default_factory=lambda: os.environ.get("DEALBOT_MQTT_WS_PATH", "/mqtt").strip()
+        or "/mqtt"
+    )
     qos: int = field(default_factory=lambda: int(os.environ.get("DEALBOT_MQTT_QOS", "0")))
     keepalive_s: int = field(
         default_factory=lambda: int(os.environ.get("DEALBOT_MQTT_KEEPALIVE_S", "45"))
@@ -88,13 +100,16 @@ class AgentEventPublisher:
             return True
         try:
             client_id = f"dealbot-{self.job_id[:8]}-{uuid.uuid4().hex[:6]}"
+            transport = "websockets" if self.transport in {"ws", "websocket", "websockets"} else "tcp"
             client = mqtt.Client(
                 callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
                 client_id=client_id,
                 clean_session=True,
                 protocol=mqtt.MQTTv311,
-                transport="tcp",
+                transport=transport,
             )
+            if transport == "websockets":
+                client.ws_set_options(path=self.ws_path)
             if self.username:
                 client.username_pw_set(self.username, self.password)
             if self.use_tls:

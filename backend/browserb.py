@@ -26,7 +26,6 @@ import asyncio
 import hashlib
 import errno
 import shutil
-from contextlib import asynccontextmanager
 from pathlib import Path
 import socket
 import subprocess
@@ -36,6 +35,32 @@ from typing import Any
 from browserbase import Browserbase
 from dotenv import load_dotenv
 from stagehand import AsyncStagehand, APIResponseValidationError
+
+
+# ---------------------------------------------------------------------------
+# Anthropic base URL normalization
+# ---------------------------------------------------------------------------
+# Some host environments (e.g. Claude Desktop) export
+# ANTHROPIC_BASE_URL=https://api.anthropic.com — i.e. the bare host with no
+# "/v1" path segment. The Python SDK tolerates this (it appends "/v1/messages"),
+# but Stagehand's bundled Node SDK (@ai-sdk/anthropic) treats the value as the
+# full base and appends only "/messages", producing
+# "https://api.anthropic.com/messages" → HTTP 404 "Not Found" on every extract
+# and act call. Drop the bare-host override so both SDKs fall back to their
+# correct defaults (Python → host + /v1/messages, Node → host/v1 + /messages).
+def _normalize_anthropic_base_url() -> None:
+    raw = os.environ.get("ANTHROPIC_BASE_URL", "").strip()
+    if not raw:
+        return
+    normalized = raw.rstrip("/")
+    if normalized in {
+        "https://api.anthropic.com",
+        "http://api.anthropic.com",
+    }:
+        os.environ.pop("ANTHROPIC_BASE_URL", None)
+
+
+_normalize_anthropic_base_url()
 
 
 # ---------------------------------------------------------------------------
@@ -481,6 +506,11 @@ def _stagehand_client_config(
             "local_headless": _local_headless(),
             # Useful for debugging with headful mode where you want to inspect state.
             "local_shutdown_on_close": shutdown_on_close,
+            # The default 10s is too tight when the laptop is busy / the SEA
+            # server is cold-starting, which surfaced as "SEA server not ready".
+            "local_ready_timeout_s": float(
+                os.environ.get("STAGEHAND_LOCAL_READY_TIMEOUT_S", "30")
+            ),
         }
     if timeout is not None:
         config["timeout"] = timeout
@@ -883,6 +913,106 @@ _CONTEXT_SEND_LOCKS: dict[str, asyncio.Lock] = {}
 _ACTIVE_LISTING_SESSIONS: dict[str, dict[str, Any]] = {}
 
 
+def _listing_session_key(
+    resolved_context_id: str,
+    *,
+    use_browserbase_context: bool,
+    listing_url: str | None,
+) -> str:
+    """
+    Cache key for a reusable chat session.
+
+    Local contexts already get one window per context, so the context id is
+    enough. In shared Browserbase mode every worker shares a single context, so
+    we key per listing URL to keep one open chat window per listing instead of
+    booting a fresh cloud session for every message.
+    """
+    if use_browserbase_context and listing_url:
+        return f"bb::{resolved_context_id}::{listing_url}"
+    return resolved_context_id
+
+
+async def _acquire_listing_session(
+    *,
+    session_key: str,
+    resolved_context_id: str,
+    model_name: str,
+    use_browserbase_context: bool,
+) -> tuple[dict[str, Any], bool]:
+    """
+    Return ``(bundle, created)`` for a chat session, reusing a cached one when
+    present. New bundles are stored in ``_ACTIVE_LISTING_SESSIONS`` so the open
+    chat window survives across messages; ``created`` is True only when a brand
+    new session was started (so the caller knows it still needs to navigate).
+    """
+    bundle = _ACTIVE_LISTING_SESSIONS.get(session_key)
+    if bundle is not None:
+        return bundle, False
+
+    client = AsyncStagehand(
+        **_stagehand_client_config(use_browserbase_context=use_browserbase_context)
+    )
+    await client.__aenter__()
+    try:
+        session = await _start_stagehand_session(
+            client=client,
+            model_name=model_name,
+            context_id=resolved_context_id,
+            use_browserbase_context=use_browserbase_context,
+        )
+    except APIResponseValidationError as e:
+        print(f"Session schema error — HTTP {e.response.status_code}")
+        print(e.response.text)
+        try:
+            await client.__aexit__(None, None, None)
+        except Exception:
+            pass
+        raise
+    except BaseException:
+        try:
+            await client.__aexit__(None, None, None)
+        except Exception:
+            pass
+        raise
+
+    bundle = {"client": client, "session": session, "url": None}
+    _ACTIVE_LISTING_SESSIONS[session_key] = bundle
+    return bundle, True
+
+
+async def _close_listing_bundle(session_key: str) -> bool:
+    """End and discard a cached chat session bundle. Returns True if one existed."""
+    bundle = _ACTIVE_LISTING_SESSIONS.pop(session_key, None)
+    if not bundle:
+        return False
+    session = bundle.get("session")
+    client = bundle.get("client")
+    try:
+        if session is not None:
+            await session.end()
+    except Exception:
+        pass
+    try:
+        if client is not None:
+            await client.__aexit__(None, None, None)
+    except Exception:
+        pass
+    _CONTEXT_SEND_LOCKS.pop(session_key, None)
+    return True
+
+
+async def close_all_active_listing_sessions() -> int:
+    """
+    Close every cached chat session. Call at the end of a negotiation job so
+    reused (especially Browserbase) sessions never leak past the run.
+    """
+    closed = 0
+    for session_key in list(_ACTIVE_LISTING_SESSIONS.keys()):
+        if await _close_listing_bundle(session_key):
+            closed += 1
+    return closed
+
+
 def _context_send_lock(context_id: str) -> asyncio.Lock:
     lock = _CONTEXT_SEND_LOCKS.get(context_id)
     if lock is None:
@@ -1027,100 +1157,210 @@ async def _buyer_message_exists(session: Any, *, model_name: str) -> bool:
     return bool(payload.get("buyer_has_any_message"))
 
 
-async def _send_message_via_dom(session: Any, message: str) -> tuple[bool, bool]:
+async def _send_message_via_dom(session: Any, message: str) -> tuple[bool, bool, bool]:
+    """
+    Inject and send a chat message via direct DOM manipulation.
+
+    Returns (typed, login_required, sent_likely):
+      - typed:        the message text was placed into the composer.
+      - login_required: a Facebook login form is blocking the chat.
+      - sent_likely:  after pressing Enter/Send the composer cleared, which is a
+                      strong signal the message actually went out — lets the
+                      caller skip the slow LLM confirmation on the happy path.
+    """
     cdp_url = getattr(getattr(session, "data", None), "cdp_url", None)
     if not cdp_url:
-        return False, False
+        return False, False, False
 
     from playwright.async_api import async_playwright
 
+    # The composer does not exist until the "Message" button is clicked and
+    # Facebook finishes mounting the chat, so this waits for it to appear and
+    # inserts text the way the editor (Lexical/Draft) actually registers it.
     js = """
 (message) => {
   const msg = String(message || "");
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const isVisible = (el) => {
     if (!el) return false;
     const style = window.getComputedStyle(el);
-    return style && style.visibility !== "hidden" && style.display !== "none";
+    if (!style || style.visibility === "hidden" || style.display === "none") return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
   };
-  const clickByText = (tokens) => {
-    const all = Array.from(document.querySelectorAll('button, [role="button"], a, div, span'));
-    for (const el of all) {
-      const text = (el.innerText || el.textContent || "").trim().toLowerCase();
-      if (!text) continue;
-      if (!tokens.some((t) => text.includes(t))) continue;
+  const loginRequired = () => Boolean(
+    document.querySelector('input[name="email"], input#email, input[name="pass"], input#pass')
+  );
+  const findComposer = () => {
+    const selectors = [
+      'div[role="textbox"][contenteditable="true"][aria-label*="message" i]',
+      'div[contenteditable="true"][aria-label*="message" i]',
+      'div[contenteditable="true"][aria-placeholder*="message" i]',
+      'div[role="textbox"][contenteditable="true"]',
+      'textarea[aria-label*="message" i]',
+      'textarea[placeholder*="message" i]',
+      'textarea',
+    ];
+    for (const selector of selectors) {
+      for (const node of document.querySelectorAll(selector)) {
+        if (isVisible(node)) return node;
+      }
+    }
+    return null;
+  };
+  const labelOf = (el) => (
+    (el.getAttribute && el.getAttribute("aria-label")) || el.innerText || el.textContent || ""
+  ).trim().toLowerCase();
+  const clickMessageButton = () => {
+    const candidates = Array.from(
+      document.querySelectorAll('div[role="button"], button, [aria-label]')
+    );
+    for (const el of candidates) {
+      const label = labelOf(el);
+      if (!label) continue;
+      const exact = label === "message" || label === "message seller" || label === "send message";
+      const prefixed = label.startsWith("message ") && label.length < 24;
+      if (!exact && !prefixed) continue;
       if (!isVisible(el)) continue;
       el.click();
       return true;
     }
     return false;
   };
-
-  const loginRequired = Boolean(
-    document.querySelector('input[name="email"], input#email, input[name="pass"], input#pass')
-  );
-
-  clickByText(["message seller", "message"]);
-
-  const selectors = [
-    'div[role="textbox"][contenteditable="true"]',
-    'div[contenteditable="true"][aria-label*="message" i]',
-    'div[contenteditable="true"][aria-placeholder*="message" i]',
-    'textarea[aria-label*="message" i]',
-    'textarea[placeholder*="message" i]',
-    'textarea',
-  ];
-
-  let input = null;
-  for (const selector of selectors) {
-    for (const node of document.querySelectorAll(selector)) {
-      if (!isVisible(node)) continue;
-      input = node;
-      break;
+  const clickSend = () => {
+    for (const el of document.querySelectorAll('div[role="button"], button')) {
+      if (labelOf(el) === "send" && isVisible(el)) { el.click(); return true; }
     }
-    if (input) break;
-  }
+    return false;
+  };
+  const fireEnter = (el) => {
+    const init = { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true, cancelable: true };
+    el.dispatchEvent(new KeyboardEvent("keydown", init));
+    el.dispatchEvent(new KeyboardEvent("keypress", init));
+    el.dispatchEvent(new KeyboardEvent("keyup", init));
+  };
+  const contentOf = (el) => (el.value != null ? el.value : (el.innerText || el.textContent || ""));
 
-  if (!input) return { typed: false, login_required: loginRequired };
+  return (async () => {
+    if (loginRequired()) return { typed: false, login_required: true, sent_likely: false };
 
-  input.focus();
-  const tag = (input.tagName || "").toLowerCase();
-  if (tag === "textarea" || tag === "input") {
-    input.value = msg;
-    input.dispatchEvent(new Event("input", { bubbles: true }));
-    input.dispatchEvent(new Event("change", { bubbles: true }));
-  } else {
-    input.textContent = msg;
-    input.dispatchEvent(new InputEvent("input", { bubbles: true, data: msg, inputType: "insertText" }));
-  }
+    let input = findComposer();
+    if (!input) clickMessageButton();
+    for (let i = 0; i < 25 && !input; i++) {  // poll up to ~5s for the composer
+      await sleep(200);
+      input = findComposer();
+    }
+    if (!input) return { typed: false, login_required: loginRequired(), sent_likely: false };
 
-  const enter = { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true, cancelable: true };
-  input.dispatchEvent(new KeyboardEvent("keydown", enter));
-  input.dispatchEvent(new KeyboardEvent("keypress", enter));
-  input.dispatchEvent(new KeyboardEvent("keyup", enter));
-
-  return { typed: true, login_required: loginRequired };
+    // Tag the composer so Playwright can drive it with REAL keystrokes from
+    // Python. execCommand-based clears do not work reliably on Facebook's
+    // Lexical editor (that caused messages to concatenate); real key events do.
+    document.querySelectorAll('[data-dealbot-composer]').forEach((n) => n.removeAttribute('data-dealbot-composer'));
+    input.setAttribute('data-dealbot-composer', '1');
+    input.focus();
+    return {
+      typed: false,
+      login_required: false,
+      sent_likely: false,
+      composer_found: true,
+    };
+  })();
 }
 """
 
     typed = False
     login_required = False
+    sent_likely = False
+
+    def _norm(value: str) -> str:
+        return " ".join((value or "").split())
+
+    select_all_js = """
+() => {
+  const el = document.querySelector('[data-dealbot-composer="1"]');
+  if (!el) return false;
+  el.focus();
+  const sel = window.getSelection();
+  const range = document.createRange();
+  range.selectNodeContents(el);
+  sel.removeAllRanges();
+  sel.addRange(range);
+  return true;
+}
+"""
+    read_js = """
+() => {
+  const el = document.querySelector('[data-dealbot-composer="1"]');
+  if (!el) return "";
+  return (el.value != null ? el.value : (el.innerText || el.textContent || ""));
+}
+"""
+
     playwright = await async_playwright().start()
     try:
         browser = await playwright.chromium.connect_over_cdp(cdp_url)
         if not browser.contexts:
-            return False, False
+            return False, False, False
         context = browser.contexts[0]
         if not context.pages:
-            return False, False
+            return False, False, False
         page = context.pages[-1]
-        result = await page.evaluate(js, message)
-        if isinstance(result, dict):
-            typed = bool(result.get("typed"))
-            login_required = bool(result.get("login_required"))
+
+        # The JS blob opens the composer (clicking "Message" if needed), waits for
+        # it to mount, and tags it with data-dealbot-composer="1".
+        prep = await page.evaluate(js, message)
+        if not isinstance(prep, dict):
+            return False, False, False
+        if prep.get("login_required"):
+            return False, True, False
+        if not prep.get("composer_found"):
+            return False, False, False
+
+        composer = page.locator('[data-dealbot-composer="1"]').last
+        try:
+            await composer.click(timeout=4000)
+        except Exception:
+            pass
+
+        async def _clear_and_type() -> bool:
+            # Select all existing content via the Selection API, then delete it
+            # with a REAL Backspace keystroke (Lexical honors real key events, not
+            # execCommand) so retries never concatenate onto leftover text.
+            await page.evaluate(select_all_js)
+            await page.keyboard.press("Backspace")
+            await asyncio.sleep(0.05)
+            await page.keyboard.insert_text(message)
+            await asyncio.sleep(0.1)
+            current = await page.evaluate(read_js)
+            return _norm(current) == _norm(message)
+
+        typed = await _clear_and_type()
+        if not typed:
+            typed = await _clear_and_type()
+        if not typed:
+            return False, False, False
+
+        await page.keyboard.press("Enter")
+        await asyncio.sleep(0.3)
+        after = await page.evaluate(read_js)
+        sent_likely = _norm(message) not in _norm(after)
+        if not sent_likely:
+            # Enter did not submit — click the Send button WITHOUT re-typing.
+            try:
+                send_btn = page.get_by_role(
+                    "button", name=re.compile(r"^send$", re.I)
+                )
+                if await send_btn.count() > 0:
+                    await send_btn.first.click(timeout=3000)
+                    await asyncio.sleep(0.3)
+                    after = await page.evaluate(read_js)
+                    sent_likely = _norm(message) not in _norm(after)
+            except Exception:
+                pass
     finally:
         await playwright.stop()
 
-    return typed, login_required
+    return typed, login_required, sent_likely
 
 
 async def _send_message_and_confirm(
@@ -1129,13 +1369,24 @@ async def _send_message_and_confirm(
     message: str,
     model_name: str,
 ) -> bool:
-    dom_typed, login_required = await _send_message_via_dom(session, message)
+    dom_typed, login_required, sent_likely = await _send_message_via_dom(session, message)
     if login_required:
         raise RuntimeError(
             "Facebook login is required in this listing window before sending messages."
         )
 
+    # Happy path: the composer cleared right after we pressed Enter/Send, so the
+    # message almost certainly went out. Trust it and skip the LLM confirm to
+    # save a slow extract round-trip on every negotiation message.
+    if dom_typed and sent_likely:
+        return True
+
     if dom_typed:
+        # Typed cleanly but couldn't confirm the send locally — verify with one
+        # extract. We do NOT re-type via act(): re-typing into a composer that
+        # may still hold the text is what produced the concatenated "bulk"
+        # messages. If it isn't confirmed, soft-fail and let the next round retry
+        # (the DOM path always clears the composer before typing).
         confirmation = await session.extract(
             instruction=_build_message_sent_check_instruction(message),
             schema=MESSAGE_SEND_CHECK_SCHEMA,
@@ -1144,41 +1395,8 @@ async def _send_message_and_confirm(
         payload = _to_dict(confirmation.data.result if confirmation.data else None) or {}
         return bool(payload.get("message_sent"))
 
-    # Fallback to structured "act" steps if direct DOM send did not confirm.
-    attempts: list[list[str]] = [
-        [
-            'Click the "Message" or "Message seller" button to open the composer.',
-            "Focus the chat input box where a new message can be typed.",
-            f"Type this exact message into the focused input: {json.dumps(message)}",
-            "Send by pressing Enter.",
-        ],
-        [
-            "Focus the chat input box where a new message can be typed.",
-            f"Type this exact message into the focused input: {json.dumps(message)}",
-            'Click the "Send" button to submit the typed message.',
-        ],
-    ]
-
-    for steps in attempts:
-        try:
-            for step in steps:
-                await session.act(
-                    input=step,
-                    options={"model": model_name},
-                )
-        except Exception:
-            # Continue into confirmation check/fallback attempt.
-            pass
-
-        confirmation = await session.extract(
-            instruction=_build_message_sent_check_instruction(message),
-            schema=MESSAGE_SEND_CHECK_SCHEMA,
-            options={"model": model_name},
-        )
-        payload = _to_dict(confirmation.data.result if confirmation.data else None) or {}
-        if payload.get("message_sent"):
-            return True
-
+    # DOM send could not even place the text — soft-fail; the worker retries next
+    # round. Avoid LLM act() re-typing, which concatenates and burns credits.
     return False
 
 
@@ -1209,11 +1427,6 @@ async def _start_stagehand_session(
     if not session.id:
         raise RuntimeError(f"Expected session ID, got {session!r}")
     return session
-
-
-@asynccontextmanager
-async def _noop_async_context_manager():
-    yield
 
 
 # ---------------------------------------------------------------------------
@@ -1579,36 +1792,31 @@ async def _get_or_create_active_listing_session(
     return client, session
 
 
-async def close_active_listing_browser(stagehand_context_id: str) -> bool:
+async def close_active_listing_browser(
+    stagehand_context_id: str,
+    *,
+    listing_url: str | None = None,
+) -> bool:
     """
-    Close a persistent local listing browser session for a worker context.
-    Returns True when a live persistent bundle existed and was closed.
+    Close the reusable chat session for a worker. In shared Browserbase mode the
+    session is keyed per listing, so ``listing_url`` is required to target it;
+    local contexts are keyed by context id. Returns True when a live bundle
+    existed and was closed.
     """
     browserbase_mode, decoded_context_id = _decode_context_ref(stagehand_context_id)
     if browserbase_mode:
-        # Current persistent reuse tracking is local-context only.
-        return False
+        if not listing_url:
+            return False
+        resolved_context_id = _resolve_browserbase_context_id(decoded_context_id)
+    else:
+        resolved_context_id = _resolve_stagehand_context_id(decoded_context_id)
 
-    resolved_context_id = _resolve_stagehand_context_id(decoded_context_id)
-    active_bundle = _ACTIVE_LISTING_SESSIONS.pop(resolved_context_id, None)
-    if not active_bundle:
-        return False
-
-    session = active_bundle.get("session")
-    client = active_bundle.get("client")
-    try:
-        if session is not None:
-            await session.end()
-    except Exception:
-        pass
-    try:
-        if client is not None:
-            await client.__aexit__(None, None, None)
-    except Exception:
-        pass
-
-    _CONTEXT_SEND_LOCKS.pop(resolved_context_id, None)
-    return True
+    session_key = _listing_session_key(
+        resolved_context_id,
+        use_browserbase_context=browserbase_mode,
+        listing_url=listing_url,
+    )
+    return await _close_listing_bundle(session_key)
 
 
 async def _scrape_listings_with_shared_session(
@@ -1872,70 +2080,52 @@ async def send_listing_message(
         else _resolve_stagehand_context_id(decoded_context_id, listing_url=listing_url)
     )
 
-    lock: asyncio.Lock | None = None
-    if not use_browserbase_context:
-        lock = _context_send_lock(resolved_context_id)
-        if lock.locked():
-            _debug_print(
-                resolved_context_id[:12],
-                "another message send is in progress; waiting for context lock…",
-            )
+    session_key = _listing_session_key(
+        resolved_context_id,
+        use_browserbase_context=use_browserbase_context,
+        listing_url=listing_url,
+    )
+    log_label = session_key[:24]
 
-    lock_context = lock if lock is not None else _noop_async_context_manager()
-    async with lock_context:
-        active_bundle = _ACTIVE_LISTING_SESSIONS.get(resolved_context_id)
-        client: Any
-        session: Any
-        ephemeral_client = False
+    # Serialize sends to the same chat window (both modes) so concurrent rounds
+    # don't fight over one composer.
+    lock = _context_send_lock(session_key)
+    if lock.locked():
+        _debug_print(log_label, "another message send is in progress; waiting…")
 
-        if active_bundle and not use_browserbase_context:
-            client = active_bundle["client"]
-            session = active_bundle["session"]
-            _debug_print(
-                resolved_context_id[:12],
-                "reusing existing listing window/session for message send.",
-            )
-        else:
-            client = AsyncStagehand(
-                **_stagehand_client_config(
-                    use_browserbase_context=use_browserbase_context
-                )
-            )
-            ephemeral_client = True
-            await client.__aenter__()
-            try:
-                session = await _start_stagehand_session(
-                    client=client,
-                    model_name=model_name,
-                    context_id=resolved_context_id,
-                    use_browserbase_context=use_browserbase_context,
-                )
-            except APIResponseValidationError as e:
-                print(f"Session schema error — HTTP {e.response.status_code}")
-                print(e.response.text)
-                raise
-
-        _debug_print(
-            resolved_context_id[:12],
-            "session started, opening listing chat…",
+    async with lock:
+        bundle, created = await _acquire_listing_session(
+            session_key=session_key,
+            resolved_context_id=resolved_context_id,
+            model_name=model_name,
+            use_browserbase_context=use_browserbase_context,
         )
+        session = bundle["session"]
         _debug_print(
-            resolved_context_id[:12],
-            f"OUTBOUND message: {_message_preview(message)}",
+            log_label,
+            "started new listing chat session, opening chat…"
+            if created
+            else "reusing open listing chat session for message send.",
         )
+        _debug_print(log_label, f"OUTBOUND message: {_message_preview(message)}")
 
         try:
-            await session.navigate(
-                url=listing_url,
-                options={"wait_until": "domcontentloaded"},
-            )
+            # Only (re)load the listing when the chat window isn't already on it.
+            # Skipping this on reuse keeps the composer open and makes the send
+            # fast and reliable instead of remounting the page every message.
+            if bundle.get("url") != listing_url:
+                await session.navigate(
+                    url=listing_url,
+                    options={"wait_until": "domcontentloaded"},
+                )
+                bundle["url"] = listing_url
 
             if skip_if_buyer_message_exists and await _buyer_message_exists(
                 session,
                 model_name=model_name,
             ):
                 _debug_print(
-                    resolved_context_id[:12],
+                    log_label,
                     "buyer message already exists in chat; skipping duplicate send.",
                 )
                 return {
@@ -1949,14 +2139,19 @@ async def send_listing_message(
                 model_name=model_name,
             )
             if not sent_ok:
-                raise RuntimeError(
-                    "Unable to confirm message was sent in the listing chat."
+                # Soft-fail: don't crash the whole negotiation job over one
+                # unsent message — the worker can retry on its next round.
+                _debug_print(
+                    log_label,
+                    "unable to confirm message was sent; skipping this round.",
                 )
+                return {
+                    "sent_message": None,
+                    "reply_message": None,
+                    "send_failed": True,
+                }
 
-            _debug_print(
-                resolved_context_id[:12],
-                f"sent message, waiting {reply_wait_ms}ms…",
-            )
+            _debug_print(log_label, f"sent message, waiting {reply_wait_ms}ms…")
             await asyncio.sleep(reply_wait_ms / 1000)
 
             response = await session.extract(
@@ -1977,7 +2172,7 @@ async def send_listing_message(
                 "reply_message": reply,
             }
             _debug_print(
-                resolved_context_id[:12],
+                log_label,
                 (
                     f"INBOUND reply: {_message_preview(reply)}"
                     if reply
@@ -1985,24 +2180,14 @@ async def send_listing_message(
                 ),
             )
             return result
+        except Exception:
+            # Drop the (possibly broken) session so the next round rebuilds a
+            # clean chat window rather than reusing a wedged one.
+            await _close_listing_bundle(session_key)
+            raise
         finally:
-            if not use_browserbase_context and resolved_context_id in _ACTIVE_LISTING_SESSIONS:
+            if created and not use_browserbase_context:
                 _tile_chrome_windows()
-            elif _keep_open_on_done():
-                _debug_print(
-                    resolved_context_id[:12],
-                    "keeping session/browser open for debugging (not ending session).",
-                )
-            else:
-                try:
-                    await session.end()
-                except Exception:
-                    pass
-            if ephemeral_client:
-                try:
-                    await client.__aexit__(None, None, None)
-                except Exception:
-                    pass
 
 
 async def poll_listing_reply(
@@ -2039,46 +2224,30 @@ async def poll_listing_reply(
         else _resolve_stagehand_context_id(decoded_context_id, listing_url=listing_url)
     )
 
-    lock: asyncio.Lock | None = None
-    if not use_browserbase_context:
-        lock = _context_send_lock(resolved_context_id)
-    lock_context = lock if lock is not None else _noop_async_context_manager()
+    session_key = _listing_session_key(
+        resolved_context_id,
+        use_browserbase_context=use_browserbase_context,
+        listing_url=listing_url,
+    )
 
-    async with lock_context:
-        active_bundle = _ACTIVE_LISTING_SESSIONS.get(resolved_context_id)
-        client: Any
-        session: Any
-        ephemeral_client = False
-
-        if active_bundle and not use_browserbase_context:
-            client = active_bundle["client"]
-            session = active_bundle["session"]
-        else:
-            client = AsyncStagehand(
-                **_stagehand_client_config(
-                    use_browserbase_context=use_browserbase_context
-                )
-            )
-            ephemeral_client = True
-            await client.__aenter__()
-            try:
-                session = await _start_stagehand_session(
-                    client=client,
-                    model_name=model_name,
-                    context_id=resolved_context_id,
-                    use_browserbase_context=use_browserbase_context,
-                )
-            except APIResponseValidationError as e:
-                print(f"Session schema error — HTTP {e.response.status_code}")
-                print(e.response.text)
-                raise
+    async with _context_send_lock(session_key):
+        bundle, created = await _acquire_listing_session(
+            session_key=session_key,
+            resolved_context_id=resolved_context_id,
+            model_name=model_name,
+            use_browserbase_context=use_browserbase_context,
+        )
+        session = bundle["session"]
 
         try:
-            if listing_url and ephemeral_client:
+            # Only navigate when this is a freshly created window; a reused chat
+            # is already sitting on the listing with the thread open.
+            if listing_url and bundle.get("url") != listing_url:
                 await session.navigate(
                     url=listing_url,
                     options={"wait_until": "domcontentloaded"},
                 )
+                bundle["url"] = listing_url
             response = await session.extract(
                 instruction=_build_reply_check_instruction(sent_message),
                 schema=REPLY_CHECK_SCHEMA,
@@ -2091,19 +2260,9 @@ async def poll_listing_reply(
             if isinstance(raw_reply, str):
                 return raw_reply.strip() or None
             return None
-        finally:
-            if not use_browserbase_context and resolved_context_id in _ACTIVE_LISTING_SESSIONS:
-                pass
-            else:
-                try:
-                    await session.end()
-                except Exception:
-                    pass
-            if ephemeral_client:
-                try:
-                    await client.__aexit__(None, None, None)
-                except Exception:
-                    pass
+        except Exception:
+            await _close_listing_bundle(session_key)
+            raise
 
 
 

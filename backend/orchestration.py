@@ -15,6 +15,7 @@ import contextlib
 import json
 import os
 import re
+from datetime import datetime, timedelta
 from typing import Any, TypedDict
 
 from dotenv import load_dotenv
@@ -24,6 +25,7 @@ from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemM
 from agent_events import AgentEventPublisher
 from browserb import (
     close_active_listing_browser,
+    close_all_active_listing_sessions,
     poll_listing_reply,
     send_listing_message,
 )
@@ -32,12 +34,43 @@ from memory import AgentMemoryStore, parse_price
 
 load_dotenv()
 
+# The project stores the Anthropic key as MODEL_API_KEY, but langchain's
+# init_chat_model / ChatAnthropic and the Anthropic SDK resolve the key from
+# ANTHROPIC_API_KEY. Without this alias the negotiation model has no credentials
+# and every round fails with "Could not resolve authentication method".
+if not os.environ.get("ANTHROPIC_API_KEY") and os.environ.get("MODEL_API_KEY"):
+    os.environ["ANTHROPIC_API_KEY"] = os.environ["MODEL_API_KEY"]
+
 model = init_chat_model("claude-sonnet-4-6", temperature=0.0)
 memory = AgentMemoryStore()
 
 MAX_NEGOTIATION_ROUNDS = 8
 REPLY_WAIT_MS = int(os.environ.get("REPLY_WAIT_MS", "1200"))
 REPLY_POLL_INTERVAL_MS = int(os.environ.get("REPLY_POLL_INTERVAL_MS", "2500"))
+# How far out to propose meetups. We want the bot to be decisive and offer a
+# concrete pickup time (~2 hours from now) rather than vaguely "checking my
+# schedule". Stagger by worker so simultaneous deals don't collide on one slot.
+PICKUP_BASE_HOURS = float(os.environ.get("DEALBOT_PICKUP_HOURS", "2"))
+PICKUP_STAGGER_MIN = int(os.environ.get("DEALBOT_PICKUP_STAGGER_MIN", "30"))
+
+
+def _worker_index(worker_id: str) -> int:
+    digits = "".join(ch for ch in str(worker_id) if ch.isdigit())
+    try:
+        return max(1, int(digits))
+    except ValueError:
+        return 1
+
+
+def _proposed_pickup_time(worker_id: str) -> str:
+    """Concrete local pickup time ~PICKUP_BASE_HOURS out, staggered per worker."""
+    offset = timedelta(
+        hours=PICKUP_BASE_HOURS,
+        minutes=PICKUP_STAGGER_MIN * (_worker_index(worker_id) - 1),
+    )
+    when = datetime.now() + offset
+    # e.g. "4:30 PM" — strip any leading zero from the hour for natural phrasing.
+    return when.strftime("%I:%M %p").lstrip("0")
 TACTIC_CHOICES = (
     "anchor_low",
     "bundle",
@@ -630,6 +663,7 @@ async def create_and_send(
     else:
         leverage = "No peer worker has a trustworthy comparable price yet."
 
+    pickup_time = _proposed_pickup_time(worker_id)
     system_instruction = SystemMessage(
         content=f"""You are a professional but friendly Facebook Marketplace buyer negotiating for a lower price.
 You are messaging {_target_seller_label(state)}.
@@ -650,9 +684,10 @@ Rules:
   - Chosen tactic: {chosen_tactic}
   - Tactic rationale: {assessment['tactic_rationale']}
 - Apply this tactic guidance now: {tactic_instruction}
-- If tactic is deadline_cash_pickup, include a concrete immediate pickup time window.
+- Be decisive about logistics: when you reference meeting up, propose a SPECIFIC pickup time of around {pickup_time} today (about 2 hours from now). Never say vague things like "let me check my schedule" or "I'll let you know" — propose the concrete time and ask if it works.
+- If tactic is deadline_cash_pickup, offer cash and propose pickup today at around {pickup_time}.
 - If manager mode is probe_floor, prioritize testing a lower anchor over closing.
-- If manager mode is close_now, prioritize a realistic close with immediate pickup.
+- If manager mode is close_now, lock in the deal: confirm the price and propose meeting today at around {pickup_time} for cash pickup.
 - {leverage}
 - Write ONLY the message text to send to the seller. No quotes or explanation."""
     )
@@ -750,10 +785,10 @@ You are messaging {_target_seller_label(state)}.
 
 Rules:
 - Send exactly 1 short sentence.
-- Be polite and human.
+- Be polite, warm, and human; vary your wording (do not reuse a stock phrase).
 - Do NOT make a new offer or accept any deal.
 - Do NOT mention having multiple agents/listings.
-- Lightly delay: say you are checking timing and will confirm soon.
+- Hold lightly WITHOUT the cliche "let me check my schedule" / "I'll let you know" — instead show genuine continued interest (e.g. confirm the item still looks great, ask one small natural question about it, or say you're keen and finalizing a couple of details).
 - Output ONLY the message text."""
     )
     ai_response = await model.ainvoke([prompt, *existing_chat])
@@ -828,7 +863,10 @@ async def pull_off_worker(
     event_publisher: AgentEventPublisher | None = None,
 ) -> dict[str, Any]:
     worker_id = state["worker_id"]
-    closed = await close_active_listing_browser(state["stagehand_context_id"])
+    closed = await close_active_listing_browser(
+        state["stagehand_context_id"],
+        listing_url=state.get("listing_url"),
+    )
     await asyncio.to_thread(
         memory.update_short_term,
         worker_id,
@@ -1005,16 +1043,17 @@ async def wrap_up(
     existing_chat = memory.to_langchain_messages(worker_id)
     assessment = await _assess_seller_and_pick_tactic(state, existing_chat)
     chosen_tactic = assessment["chosen_tactic"]
+    pickup_time = _proposed_pickup_time(worker_id)
 
     if chosen_tactic == "deadline_cash_pickup":
         final_message = (
-            f"I can do ${state['current_min_price']:.0f} cash and pick up tonight "
-            "if that works for you."
+            f"I can do ${state['current_min_price']:.0f} cash and pick up today around "
+            f"{pickup_time} if that works for you."
         )
     elif chosen_tactic == "walk_away":
         final_message = (
             "No worries at all - I found another option nearby, but if you can do "
-            f"${state['current_min_price']:.0f} today I can still pick it up."
+            f"${state['current_min_price']:.0f} I can still pick it up today around {pickup_time}."
         )
     else:
         final_message = "Thanks for your time!"
@@ -1482,6 +1521,18 @@ async def launch_negotiation(
             reply_poller_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await reply_poller_task
+
+        # Tear down any reused chat sessions so cloud browsers never leak past
+        # the run (reused sessions are intentionally kept open across messages).
+        try:
+            closed_sessions = await close_all_active_listing_sessions()
+            if closed_sessions:
+                print(
+                    f"[cleanup] closed {closed_sessions} reused listing chat session(s).",
+                    flush=True,
+                )
+        except Exception as exc:
+            print(f"[cleanup] failed to close listing sessions: {exc}", flush=True)
 
     _emit_event(
         event_publisher,

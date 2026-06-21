@@ -18,6 +18,14 @@ from agent_events import AgentEventPublisher
 from browserb import initialize_browsers, send_listing_message
 from memory import AgentMemoryStore, parse_price
 
+# Load .env and alias MODEL_API_KEY -> ANTHROPIC_API_KEY before building the
+# model. ChatAnthropic / the Anthropic SDK resolve credentials from
+# ANTHROPIC_API_KEY; this project stores the key as MODEL_API_KEY. Without the
+# alias, opener generation silently falls back to templated messages.
+load_dotenv()
+if not os.environ.get("ANTHROPIC_API_KEY") and os.environ.get("MODEL_API_KEY"):
+    os.environ["ANTHROPIC_API_KEY"] = os.environ["MODEL_API_KEY"]
+
 model = init_chat_model("claude-sonnet-4-6", temperature=0.4)
 
 DEFAULT_PRODUCT_NAME = "Gray Couch"
