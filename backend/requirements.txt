@@ -1,3 +1,8 @@
 fastapi 
 uvicorn 
 pydantic
+
+arize-otel 
+openinference-instrumentation-langchain
+langgraph 
+langchain-anthropic
